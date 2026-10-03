@@ -1,0 +1,306 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+)
+
+// testSession runs a session server with bash in it and returns its
+// control client.
+func testSession(t *testing.T) (*config, *ctl) {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	// Unix socket paths are short; t.TempDir can be too long on macOS.
+	dir, err := os.MkdirTemp("/tmp", "shoulder-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	cfg := &config{Name: "test-session", Dir: dir, Command: []string{bash, "--norc", "--noprofile", "-i"},
+		Cwd: dir, Host: "testhost", Linger: time.Minute}
+	b, _ := json.Marshal(cfg)
+	os.WriteFile(cfg.path("config.json"), b, 0o600)
+	os.Setenv("PS1", "$ ")
+	done := make(chan error, 1)
+	go func() { done <- serve(dir) }()
+	c := newCtl(cfg.path("sock"))
+	t.Cleanup(func() {
+		c.post("/ctl/quit")
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	})
+	waitUntil(t, "socket", func() bool { _, err := c.do("GET", "/ctl/info"); return err == nil })
+	return cfg, c
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// agentClient makes the requests a pasted curl line would.
+type agentClient struct {
+	t    *testing.T
+	http *http.Client
+	base string
+}
+
+var urlRE = regexp.MustCompile(`(http://\S+)/$`)
+
+func agentFromPaste(t *testing.T, cfg *config, paste string) *agentClient {
+	t.Helper()
+	m := urlRE.FindStringSubmatch(paste)
+	if m == nil {
+		t.Fatalf("no URL in paste:\n%s", paste)
+	}
+	a := &agentClient{t: t, base: m[1], http: http.DefaultClient}
+	if strings.Contains(paste, "--unix-socket") {
+		a.http = newCtl(cfg.path("sock")).c
+	}
+	return a
+}
+
+func (a *agentClient) call(method, endpoint, body string) (int, string) {
+	a.t.Helper()
+	req, _ := http.NewRequest(method, a.base+"/"+endpoint, strings.NewReader(body))
+	resp, err := a.http.Do(req)
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func (a *agentClient) get(endpoint string) string {
+	a.t.Helper()
+	code, body := a.call("GET", endpoint, "")
+	if code != 200 {
+		a.t.Fatalf("GET %s: %d %s", endpoint, code, body)
+	}
+	return body
+}
+
+func TestSessionAPI(t *testing.T) {
+	cfg, c := testSession(t)
+	rw, err := c.share("unix", false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(rw.Paste, "\n") > 0 || !regexp.MustCompile(`/\d+-[a-z]+-[a-z]+/$`).MatchString(rw.Paste) {
+		t.Errorf("paste should be one line ending in the code:\n%s", rw.Paste)
+	}
+	if _, err := c.post("/ctl/start?cols=80&rows=24"); err != nil {
+		t.Fatal(err)
+	}
+	a := agentFromPaste(t, cfg, rw.Paste)
+	if g := a.get(""); !strings.Contains(g, "# shoulder") || !strings.Contains(g, "POST send-keys") || !strings.Contains(g, "read-write") {
+		t.Errorf("guide:\n%s", g)
+	}
+	waitUntil(t, "prompt", func() bool { return strings.Contains(a.get("capture-pane"), "$") })
+
+	// run types a command and returns its output once the prompt is back.
+	code, out := a.call("POST", "run?timeout=20", "echo hello; sleep 0.5; echo done-$((6*7))")
+	if code != 200 || !strings.HasPrefix(out, "[idle") || !strings.Contains(out, "\nhello\n") || !strings.Contains(out, "done-42") {
+		t.Fatalf("run: %d\n%s", code, out)
+	}
+	if s := a.get("capture-pane"); !strings.Contains(s, "done-42") {
+		t.Errorf("screen:\n%s", s)
+	}
+
+	// send + wait for a pattern.
+	if code, out := a.call("POST", "send-keys", "'sleep 0.3; echo MARK-$((1+1))' Enter"); code != 200 {
+		t.Fatalf("send: %d %s", code, out)
+	}
+	if out := a.get("wait?pattern=" + url.QueryEscape(`^MARK-\d`) + "&timeout=10"); !strings.HasPrefix(out, "[matched: MARK-2]") {
+		t.Errorf("wait pattern:\n%s", out)
+	}
+
+	// output since an offset only has what came after.
+	out = a.get("output")
+	off := regexp.MustCompile(`\[offset (\d+)\]`).FindStringSubmatch(out)
+	if off == nil {
+		t.Fatalf("no offset in output:\n%s", out)
+	}
+	a.call("POST", "run?timeout=10", "echo after")
+	if out := a.get("output?since=" + off[1]); strings.Contains(out, "hello") || !strings.Contains(out, "after") {
+		t.Errorf("output since %s:\n%s", off[1], out)
+	}
+
+	var st status
+	json.Unmarshal([]byte(a.get("status")), &st)
+	if !st.Running || !st.AtPrompt || st.Cols != 80 || st.ReadOnly {
+		t.Errorf("status: %+v", st)
+	}
+
+	// A read-only token can look but not type.
+	ro, err := c.share("unix", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := agentFromPaste(t, cfg, ro.Paste)
+	if g := r.get(""); strings.Contains(g, "send-keys") || !strings.Contains(g, "read-only") {
+		t.Errorf("read-only guide offers typing:\n%s", g)
+	}
+	if code, _ := r.call("POST", "send-keys", "'echo nope' Enter"); code != http.StatusForbidden {
+		t.Errorf("read-only send: %d", code)
+	}
+	if s := r.get("capture-pane"); !strings.Contains(s, "after") {
+		t.Errorf("read-only screen:\n%s", s)
+	}
+	if code, _ := a.call("GET", "../nope/screen", ""); code == 200 {
+		t.Error("bad token accepted")
+	}
+
+	// localhost serves the same session over TCP.
+	lh, err := c.share("localhost", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := agentFromPaste(t, cfg, lh.Paste)
+	if !strings.HasPrefix(l.base, "http://127.0.0.1:") {
+		t.Errorf("localhost base %s", l.base)
+	}
+	if s := l.get("capture-pane"); !strings.Contains(s, "after") {
+		t.Errorf("localhost screen:\n%s", s)
+	}
+	// Wrong codes on a network share lock it, even against the right code.
+	bad := &agentClient{t: t, http: l.http, base: strings.TrimSuffix(l.base, path.Base(l.base)) + "1-not-it"}
+	for range maxFails {
+		bad.call("GET", "status", "")
+	}
+	if code, _ := l.call("GET", "status", ""); code != http.StatusTooManyRequests {
+		t.Errorf("after %d wrong codes, the right one got %d; want 429", maxFails, code)
+	}
+	if s := a.get("capture-pane"); !strings.Contains(s, "after") {
+		t.Errorf("localhost screen:\n%s", s)
+	}
+
+	// A terminal attaching gets the screen repainted.
+	conn, err := net.Dial("unix", cfg.path("sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET /ctl/attach?cols=80&rows=24 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: shoulder\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("attach: %v %v", resp, err)
+	}
+	typ, p, err := readFrame(br)
+	if err != nil || typ != frameData || !strings.Contains(string(p), "done-42") {
+		t.Fatalf("repaint: %d %q %v", typ, p, err)
+	}
+	// Typing in the terminal reaches the command, and its exit reaches the terminal.
+	writeFrame(conn, frameData, []byte("exit 3\r"))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		typ, p, err := readFrame(br)
+		if err != nil {
+			t.Fatalf("waiting for exit: %v", err)
+		}
+		if typ == frameExit {
+			if len(p) != 4 || p[0] != 3 {
+				t.Errorf("exit frame %v", p)
+			}
+			break
+		}
+	}
+	if out := a.get("wait?timeout=5"); !strings.HasPrefix(out, "[exited with status 3]") {
+		t.Errorf("wait after exit:\n%s", out)
+	}
+	json.Unmarshal([]byte(a.get("status")), &st)
+	if st.Running || st.ExitCode == nil || *st.ExitCode != 3 {
+		t.Errorf("status after exit: %+v", st)
+	}
+}
+
+func TestKeyBytes(t *testing.T) {
+	for k, want := range map[string]string{
+		"Enter": "\r", "C-c": "\x03", "C-C": "\x03", "C-[": "\x1b", "Up": "\x1b[A", "Esc": "\x1b",
+		"M-x": "\x1bx", "q": "q", "F5": "\x1b[15~", "PageUp": "\x1b[5~",
+	} {
+		got, err := keyBytes(k)
+		if err != nil || string(got) != want {
+			t.Errorf("keyBytes(%q) = %q, %v; want %q", k, got, err, want)
+		}
+	}
+	if _, err := keyBytes("Bogus"); err == nil {
+		t.Error("unknown key accepted")
+	}
+}
+
+func TestCleanLines(t *testing.T) {
+	got := cleanLines("a\r\n\x1b[31mred\x1b[0m\nprogress 10%\rprogress 99%\nbell\a!\n")
+	if want := []string{"a", "red", "progress 99%", "bell!"}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("cleanLines = %q, want %q", got, want)
+	}
+}
+
+func TestCarriageReturnOverwrites(t *testing.T) {
+	for in, want := range map[string]string{
+		"progress 10%\rprogress 99%": "progress 99%",
+		"14:09 prompt line\r":        "14:09 prompt line",
+		"abcdef\rXY":                 "XYcdef",
+	} {
+		if got := cleanLines(in); len(got) != 1 || got[0] != want {
+			t.Errorf("cleanLines(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSendKeysBytes(t *testing.T) {
+	for in, want := range map[string]string{
+		"'git status' Enter":     "git status\r",
+		"C-c":                    "\x03",
+		"Escape :wq Enter":       "\x1b:wq\r",
+		`"say \"hi\"" Enter`:     `say "hi"` + "\r",
+		"-l Enter":               "Enter",
+		"y":                      "y",
+		"ls -la Enter":           "ls-la\r", // like tmux: separate words, no spaces between
+		"'ls -la' Enter Up Down": "ls -la\r\x1b[A\x1b[B",
+	} {
+		got, err := sendKeysBytes(in)
+		if err != nil || string(got) != want {
+			t.Errorf("sendKeysBytes(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "'unterminated", `"also`} {
+		if _, err := sendKeysBytes(bad); err == nil {
+			t.Errorf("sendKeysBytes(%q) accepted", bad)
+		}
+	}
+}
+
+func TestCode(t *testing.T) {
+	if len(codeWords) != 256 {
+		t.Errorf("%d code words; want 256", len(codeWords))
+	}
+	if c := newCode(); !regexp.MustCompile(`^\d{1,2}-[a-z]+-[a-z]+$`).MatchString(c) {
+		t.Errorf("code %q", c)
+	}
+}
