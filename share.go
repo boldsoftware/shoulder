@@ -14,6 +14,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tailscale/tailcat"
+	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 )
 
 // Transports: how an agent reaches the session.
@@ -39,7 +43,7 @@ type share struct {
 	warning   string
 	ln        net.Listener
 	srv       *http.Server
-	proc      *exec.Cmd // tailcat, when it carries the share
+	tc        *tailcat.Server // when tailcat carries the share
 }
 
 func (sh *share) url(token string) string { return sh.base + "/" + token }
@@ -88,9 +92,8 @@ func (sh *share) close() {
 	if sh.srv != nil {
 		sh.srv.Close()
 	}
-	if sh.proc != nil && sh.proc.Process != nil {
-		sh.proc.Process.Kill()
-		sh.proc.Wait()
+	if sh.tc != nil {
+		sh.tc.Close()
 	}
 }
 
@@ -191,45 +194,42 @@ func tailscaleAddress(ctx context.Context) (ip, name string, err error) {
 	return ip, strings.TrimSuffix(st.Self.DNSName, "."), nil
 }
 
-// tailcatShare puts the API on an ephemeral tailcat node. Agents reach it
-// with `tailcat socks curl http://<address>:<port>/...`.
+// tailcatShare puts the API on an ephemeral tailcat node, run in this
+// process: an encrypted WireGuard tunnel that reaches across NATs, with no
+// account and nothing listening on this machine's network. Agents reach
+// it with the stock tailcat client: `tailcat socks curl`.
 func tailcatShare(ctx context.Context, s *server) (*share, error) {
-	bin, err := exec.LookPath("tailcat")
+	logf := logger.Discard
+	if f, err := os.OpenFile(s.cfg.path("tailcat.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		logf = log.New(f, "", log.LstdFlags).Printf
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	// Pick the nearest public relay region ourselves, as the tailcat CLI
+	// does, so the address can name it by ID instead of embedding it.
+	pick := &tailcat.ConnInfo{RegionID: -1}
+	if err := pick.Expand(ctx, tailcat.ExpandForServer); err != nil {
+		return nil, fmt.Errorf("tailcat: choosing a relay: %w", err)
+	}
+	region := pick.Region[0]
+	priv, psk := key.NewNode(), tailcat.NewPresharedKey()
+	tc := &tailcat.Server{Key: priv, PresharedKey: psk, Region: region, Logf: logf}
+	ln, err := tc.Listen(ctx, "tcp", ":80")
 	if err != nil {
-		return nil, errors.New("tailcat isn't installed: go install github.com/tailscale/tailcat/cmd/tailcat@latest")
+		tc.Close()
+		return nil, fmt.Errorf("tailcat: %w", err)
 	}
-	sh, err := listenShare(s, "tailcat", "127.0.0.1", "127.0.0.1", "")
-	if err != nil {
-		return nil, err
+	ci := tailcat.ConnInfo{
+		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
+		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+		PresharedKey:      psk,
+		RegionID:          region.RegionID,
 	}
-	port := sh.ln.Addr().(*net.TCPAddr).Port
-	addrFile := s.cfg.path("tailcat.addr")
-	os.Remove(addrFile)
-	cmd := exec.Command(bin, "--serve="+strconv.Itoa(port), "--key=new")
-	cmd.Env = append(os.Environ(), "TAILCAT_ADDR_FILE="+addrFile)
-	if logf, err := os.OpenFile(s.cfg.path("tailcat.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
-		cmd.Stdout, cmd.Stderr = logf, logf
-	}
-	if err := cmd.Start(); err != nil {
-		sh.close()
-		return nil, err
-	}
-	sh.proc = cmd
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if b, err := os.ReadFile(addrFile); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-			addr := strings.TrimSpace(string(b))
-			sh.curl = "tailcat socks curl -s"
-			sh.base = "http://" + addr + ":" + strconv.Itoa(port)
-			sh.warning = "The agent's machine needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"
-			return sh, nil
-		}
-		if time.Now().After(deadline) || ctx.Err() != nil {
-			sh.close()
-			return nil, errors.New("tailcat didn't come up; see " + s.cfg.path("tailcat.log"))
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
+		warning: "The agent's machine needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
+	sh.srv = &http.Server{Handler: s.handler(sh)}
+	go sh.srv.Serve(ln)
+	return sh, nil
 }
 
 func shellQuote(s string) string {
