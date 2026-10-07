@@ -151,10 +151,11 @@ func (s *server) notifyLocked() {
 	s.changed = make(chan struct{})
 }
 
-// start runs the command at the given size. The command's environment
-// has $SHOULDER (the session name) and $SHOULDER_SHARE (what to paste to
-// an agent), so the share is never more than an echo away.
-func (s *server) start(cols, rows int, share string) error {
+// start runs the command at the given size. Its environment has
+// $SHOULDER, the session name, which keeps shoulder from starting a
+// session inside itself. (The codes stay out of the environment: they're
+// secrets, and children inherit it.)
+func (s *server) start(cols, rows int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil {
@@ -162,7 +163,7 @@ func (s *server) start(cols, rows int, share string) error {
 	}
 	cmd := exec.Command(s.cfg.Command[0], s.cfg.Command[1:]...)
 	cmd.Dir = s.cfg.Cwd
-	cmd.Env = append(os.Environ(), "SHOULDER="+s.cfg.Name, "SHOULDER_SHARE="+share)
+	cmd.Env = append(os.Environ(), "SHOULDER="+s.cfg.Name)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 	if err != nil {
 		return err
@@ -432,7 +433,7 @@ func (s *server) ctlStart(w http.ResponseWriter, r *http.Request) {
 	if cols <= 0 || rows <= 0 {
 		cols, rows = 80, 24
 	}
-	if err := s.start(cols, rows, r.URL.Query().Get("share")); err != nil {
+	if err := s.start(cols, rows); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 	}
 }

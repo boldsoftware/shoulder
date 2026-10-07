@@ -96,7 +96,12 @@ flags:
 	port := fs.Int("port", 0, "TCP port for localhost/lan/tailscale/tailcat shares (default: any free port)")
 	name := fs.String("name", "", "session name (default: two random words)")
 	linger := fs.Duration("linger", 10*time.Minute, "keep serving the final screen this long after the command exits")
+	nested := fs.Bool("nested", false, "allow starting a session inside another shoulder session")
 	fs.Parse(args)
+
+	if outer := os.Getenv("SHOULDER"); outer != "" && !*nested {
+		return fmt.Errorf("already inside shoulder session %s; `shoulder share %s` prints its line for an agent (-nested starts one anyway)", outer, outer)
+	}
 
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return errors.New("shoulder needs a terminal")
@@ -146,7 +151,7 @@ flags:
 		}
 	}
 	cols, rows := termSize()
-	q := url.Values{"cols": {strconv.Itoa(cols)}, "rows": {strconv.Itoa(rows)}, "share": {info.Paste}}
+	q := url.Values{"cols": {strconv.Itoa(cols)}, "rows": {strconv.Itoa(rows)}}
 	if _, err := ctl.post("/ctl/start?" + q.Encode()); err != nil {
 		return err
 	}
