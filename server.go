@@ -151,8 +151,10 @@ func (s *server) notifyLocked() {
 	s.changed = make(chan struct{})
 }
 
-// start runs the command at the given size.
-func (s *server) start(cols, rows int) error {
+// start runs the command at the given size. The command's environment
+// has $SHOULDER (the session name) and $SHOULDER_SHARE (what to paste to
+// an agent), so the share is never more than an echo away.
+func (s *server) start(cols, rows int, share string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd != nil {
@@ -160,7 +162,7 @@ func (s *server) start(cols, rows int) error {
 	}
 	cmd := exec.Command(s.cfg.Command[0], s.cfg.Command[1:]...)
 	cmd.Dir = s.cfg.Cwd
-	cmd.Env = append(os.Environ(), "SHOULDER="+s.cfg.Name)
+	cmd.Env = append(os.Environ(), "SHOULDER="+s.cfg.Name, "SHOULDER_SHARE="+share)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 	if err != nil {
 		return err
@@ -269,10 +271,9 @@ func (s *server) resizeLocked(cols, rows int) {
 // frames: [type u8][len u32 LE][payload].
 
 const (
-	frameData   = 1 // both directions: terminal bytes
-	frameWinch  = 2 // client→server: cols u16, rows u16
-	frameDetach = 3 // client→server
-	frameExit   = 4 // server→client: exit status u32
+	frameData  = 1 // both directions: terminal bytes
+	frameWinch = 2 // client→server: cols u16, rows u16
+	frameExit  = 4 // server→client: exit status u32
 )
 
 type client struct {
@@ -397,8 +398,6 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 				}
 				s.mu.Unlock()
 			}
-		case frameDetach:
-			return
 		}
 	}
 }
@@ -433,7 +432,7 @@ func (s *server) ctlStart(w http.ResponseWriter, r *http.Request) {
 	if cols <= 0 || rows <= 0 {
 		cols, rows = 80, 24
 	}
-	if err := s.start(cols, rows); err != nil {
+	if err := s.start(cols, rows, r.URL.Query().Get("share")); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 	}
 }

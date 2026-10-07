@@ -213,21 +213,23 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 		return nil, fmt.Errorf("tailcat: choosing a relay: %w", err)
 	}
 	region := pick.Region[0]
-	priv, psk := key.NewNode(), tailcat.NewPresharedKey()
-	tc := &tailcat.Server{Key: priv, PresharedKey: psk, Region: region, Logf: logf}
+	priv := key.NewNode()
+	tc := &tailcat.Server{Key: priv, DisablePresharedKey: true, Region: region, Logf: logf}
 	ln, err := tc.Listen(ctx, "tcp", ":80")
 	if err != nil {
 		tc.Close()
 		return nil, fmt.Errorf("tailcat: %w", err)
 	}
+	// The shortest address current clients accept: no pre-shared key (the
+	// access code guards the session; WireGuard still encrypts), and the
+	// relay named by region ID.
 	ci := tailcat.ConnInfo{
 		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
-		PresharedKey:      psk,
 		RegionID:          region.RegionID,
 	}
 	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		note: "Nothing to install here. The agent's machine runs tailcat v0.7.0+: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
+		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
 	sh.srv = &http.Server{Handler: s.handler(sh)}
 	go sh.srv.Serve(ln)
 	return sh, nil

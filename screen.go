@@ -48,7 +48,7 @@ func screenANSI(vt vt10x.Terminal) []byte {
 	b.WriteString("\x1b[0m\x1b[H\x1b[2J")
 	if vt.Mode()&vt10x.ModeAltScreen != 0 {
 		// Full-screen programs expect the alternate screen; entering it
-		// also means detaching later restores the user's own screen.
+		// also means leaving later restores the user's own screen.
 		b.WriteString("\x1b[?1049h\x1b[H\x1b[2J")
 	}
 	var cur vt10x.Glyph

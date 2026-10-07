@@ -1,7 +1,7 @@
 // Command shoulder runs a command in a terminal session you can hand
 // to an agent. It is dtach with an HTTP API: the command
 // runs in a PTY owned by a background session server, your terminal
-// attaches to it (Ctrl-\ detaches; `shoulder attach` reattaches), and
+// attaches to it (`shoulder attach` reattaches if it goes away), and
 // agents read the screen, wait for output, and type, over plain curl.
 //
 //	shoulder [flags] [--] [command [args...]]   # default $SHELL
@@ -82,7 +82,7 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("shoulder", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: shoulder [flags] [--] [command [args...]]   run command (default $SHELL) in a shareable session
-       shoulder attach [name]                           reattach a terminal (Ctrl-\ detaches)
+       shoulder attach [name]                           reattach a terminal to a running session
        shoulder share [-t transport] [-read-only] [name] print the text to paste to an agent
        shoulder ls                                      list sessions
 
@@ -145,14 +145,9 @@ flags:
 			return err
 		}
 	}
-	label := info.Transport
-	if info.ReadOnly {
-		label += ", read-only"
-	}
-	fmt.Printf("shoulder: session %s, shared via %s. Ctrl-\\ detaches; `%s share %s` shows the paste text again.\n",
-		cfg.Name, label, selfCommand(), cfg.Name)
 	cols, rows := termSize()
-	if _, err := ctl.post(fmt.Sprintf("/ctl/start?cols=%d&rows=%d", cols, rows)); err != nil {
+	q := url.Values{"cols": {strconv.Itoa(cols)}, "rows": {strconv.Itoa(rows)}, "share": {info.Paste}}
+	if _, err := ctl.post("/ctl/start?" + q.Encode()); err != nil {
 		return err
 	}
 	return attach(cfg, false)
@@ -333,11 +328,18 @@ func drawFirstScreen(cfg *config, info shareInfo, note string) {
 		}
 		p("%s  ", label)
 	}
-	ro, rw := "read-write", "read-only"
-	if info.ReadOnly {
-		ro, rw = rw, ro
+	p("\n%saccess%s ", bold, reset)
+	for _, ro := range []bool{false, true} {
+		label := "[r] read-write"
+		if ro {
+			label = "[r] read-only"
+		}
+		if ro == info.ReadOnly {
+			label = rev + label + reset
+		}
+		p("%s  ", label)
 	}
-	p("\n%saccess%s [r] %s%s%s  (r switches to %s)\n", bold, reset, rev, ro, reset, rw)
+	p("\n")
 	p("\n%s[enter]%s start %s   %s[c]%s copy   %s[q]%s quit\n", bold, reset, filepath.Base(cfg.Command[0]), bold, reset, bold, reset)
 	if note != "" {
 		p("\n%s\n", note)
@@ -362,26 +364,6 @@ func copyToClipboard(s string) error {
 	}
 	cmd.Stdin = strings.NewReader(s)
 	return cmd.Run()
-}
-
-// selfCommand is how to run shoulder again from another terminal.
-func selfCommand() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "shoulder"
-	}
-	if p, err := exec.LookPath("shoulder"); err == nil {
-		a, _ := filepath.EvalSymlinks(p)
-		b, _ := filepath.EvalSymlinks(exe)
-		if a == b {
-			return "shoulder"
-		}
-	}
-	if strings.Contains(exe, string(filepath.Separator)+"go-build") {
-		// A `go run` binary is deleted when go run exits.
-		return "go run github.com/boldsoftware/shoulder@latest"
-	}
-	return tildePath(exe)
 }
 
 // ---------------------------------------------------------------------------
@@ -509,11 +491,9 @@ func attachCmd(args []string) error {
 // ---------------------------------------------------------------------------
 // Attaching a terminal.
 
-const detachKey = 0x1c // Ctrl-\
-
-// terminalReset undoes modes a full-screen program may have left on, so a
-// detached terminal is usable again. Leaving the alternate screen can
-// restore a stale saved cursor, so it ends at the bottom row.
+// terminalReset undoes modes a full-screen program may have left on, so
+// the terminal is usable after the session ends. Leaving the alternate
+// screen can restore a stale saved cursor, so it ends at the bottom row.
 const terminalReset = "\x1b[0m\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[999;1H"
 
 // attach connects this terminal to a session. A terminal that just
@@ -560,7 +540,6 @@ func attach(cfg *config, repaint bool) error {
 		}
 	}()
 
-	detached := make(chan struct{})
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -568,17 +547,7 @@ func attach(cfg *config, repaint bool) error {
 			if err != nil {
 				return
 			}
-			chunk := buf[:n]
-			if i := strings.IndexByte(string(chunk), detachKey); i >= 0 {
-				if i > 0 {
-					writeFrame(conn, frameData, chunk[:i])
-				}
-				writeFrame(conn, frameDetach, nil)
-				close(detached)
-				conn.Close()
-				return
-			}
-			if writeFrame(conn, frameData, chunk) != nil {
+			if writeFrame(conn, frameData, buf[:n]) != nil {
 				return
 			}
 		}
@@ -604,12 +573,6 @@ func attach(cfg *config, repaint bool) error {
 	}
 	restore()
 	os.Stdout.WriteString(terminalReset)
-	select {
-	case <-detached:
-		fmt.Printf("\r\n[detached from %s; reattach with: %s attach %s]\n", cfg.Name, selfCommand(), cfg.Name)
-		return nil
-	default:
-	}
 	if exitCode >= 0 {
 		fmt.Printf("\r\n[%s exited with status %s; agents can still read the session for %s]\n",
 			filepath.Base(cfg.Command[0]), strconv.Itoa(exitCode), cfg.Linger)

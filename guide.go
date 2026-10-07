@@ -10,7 +10,7 @@ import (
 // paste is what the user hands to an agent: one command, whose output
 // (the guide) tells the agent everything else.
 func paste(cfg *config, sh *share, token string, readOnly bool) string {
-	return "Run this to use my terminal: " + sh.curl + " " + sh.url(token) + "/"
+	return sh.curl + " " + sh.url(token) + "/"
 }
 
 // guide is the full description, served at the base URL.
