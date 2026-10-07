@@ -319,6 +319,9 @@ func drawFirstScreen(cfg *config, info shareInfo, note string) {
 	}
 	p("\x1b[H\x1b[2J%sshoulder%s · session %s%s%s · %s\n\n", bold, reset, bold, cfg.Name, reset, displayCommand(cfg.Command))
 	p("Paste this to an agent (Claude Code, Codex, or one on another machine):\n\n%s%s%s\n\n", bold, info.Paste, reset)
+	if info.Note != "" {
+		p("%s\n", info.Note)
+	}
 	if info.Warning != "" {
 		p("%s⚠ %s%s\n", "\x1b[33m", info.Warning, reset)
 	}
@@ -482,6 +485,9 @@ func shareCmd(args []string) error {
 	info, err := newCtl(cfg.path("sock")).share(*transport, *readOnly, false)
 	if err != nil {
 		return err
+	}
+	if info.Note != "" {
+		fmt.Fprintln(os.Stderr, info.Note)
 	}
 	if info.Warning != "" {
 		fmt.Fprintln(os.Stderr, "⚠", info.Warning)

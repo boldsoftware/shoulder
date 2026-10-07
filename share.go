@@ -40,7 +40,8 @@ type share struct {
 	transport string
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
 	base      string // URL the paths hang off, e.g. "http://127.0.0.1:7357"
-	warning   string
+	warning   string // a risk the user should know about
+	note      string // how the agent's side works
 	ln        net.Listener
 	srv       *http.Server
 	tc        *tailcat.Server // when tailcat carries the share
@@ -226,7 +227,7 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 		RegionID:          region.RegionID,
 	}
 	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		warning: "The agent's machine needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
+		note: "Nothing to install here. The agent's machine runs tailcat v0.7.0+: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
 	sh.srv = &http.Server{Handler: s.handler(sh)}
 	go sh.srv.Serve(ln)
 	return sh, nil

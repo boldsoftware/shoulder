@@ -444,6 +444,7 @@ type shareInfo struct {
 	ReadOnly  bool   `json:"read_only"`
 	Paste     string `json:"paste"`
 	Warning   string `json:"warning,omitempty"`
+	Note      string `json:"note,omitempty"`
 }
 
 func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
@@ -460,7 +461,7 @@ func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
 	if readOnly {
 		token = s.roToken
 	}
-	writeJSON(w, shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, token, readOnly), Warning: sh.warning})
+	writeJSON(w, shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, token, readOnly), Warning: sh.warning, Note: sh.note})
 }
 
 // share returns the listener for transport, setting it up if need be.
