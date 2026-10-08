@@ -2,139 +2,122 @@ package main
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
-	"github.com/hinshun/vt10x"
+	"github.com/charmbracelet/x/vt"
 )
 
-// Glyph attribute bits, mirroring vt10x's unexported ones.
-const (
-	attrReverse = 1 << iota
-	attrUnderline
-	attrBold
-	attrGfx
-	attrItalic
-	attrBlink
-)
+// vterm is the session's model of the screen: a charmbracelet/x/vt
+// emulator fed everything the command prints, plus the bits of mode state
+// a repaint has to restore. Callers serialize access.
+type vterm struct {
+	emu           *vt.Emulator
+	cursorVisible bool
+	modes         map[ansi.DECMode]bool
+	leftAlt       bool // the program left the alternate screen since the last check
+}
 
-// screenText renders the emulator's screen as plain text, one line per
-// row, trailing blanks trimmed. Callers hold the emulator lock.
-func screenText(vt vt10x.Terminal) string {
-	cols, rows := vt.Size()
-	lines := make([]string, rows)
-	var b strings.Builder
-	for y := range rows {
-		b.Reset()
-		for x := range cols {
-			r := vt.Cell(x, y).Char
-			if r == 0 {
-				r = ' '
+// replayModes are the input modes a reattaching terminal needs restored for
+// keys, the mouse, and pasting to keep working.
+var replayModes = []ansi.DECMode{
+	ansi.ModeCursorKeys,
+	ansi.ModeMouseNormal, ansi.ModeMouseButtonEvent, ansi.ModeMouseAnyEvent, ansi.ModeMouseExtSgr,
+	ansi.ModeFocusEvent, ansi.ModeBracketedPaste,
+}
+
+// newTerm makes an emulator of the given size. The emulator answers
+// terminal queries (cursor position, device attributes) through replies,
+// which must be drained, or writing to the emulator blocks.
+func newTerm(cols, rows int, replies func([]byte)) *vterm {
+	t := &vterm{emu: vt.NewEmulator(cols, rows), cursorVisible: true, modes: map[ansi.DECMode]bool{}}
+	t.emu.SetCallbacks(vt.Callbacks{
+		CursorVisibility: func(v bool) { t.cursorVisible = v },
+		AltScreen: func(on bool) {
+			if !on {
+				t.leftAlt = true
 			}
-			b.WriteRune(r)
+		},
+		EnableMode: func(m ansi.Mode) {
+			if d, ok := m.(ansi.DECMode); ok {
+				t.modes[d] = true
+			}
+		},
+		DisableMode: func(m ansi.Mode) {
+			if d, ok := m.(ansi.DECMode); ok {
+				delete(t.modes, d)
+			}
+		},
+	})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := t.emu.Read(buf)
+			if n > 0 {
+				replies(append([]byte(nil), buf[:n]...))
+			}
+			if err != nil {
+				return
+			}
 		}
-		lines[y] = strings.TrimRight(b.String(), " ")
+	}()
+	return t
+}
+
+func (t *vterm) write(b []byte)  { t.emu.Write(b) }
+func (t *vterm) altScreen() bool { return t.emu.IsAltScreen() }
+
+// tookLeftAlt reports, once, that the program has left the alternate
+// screen.
+func (t *vterm) tookLeftAlt() bool {
+	left := t.leftAlt
+	t.leftAlt = false
+	return left
+}
+func (t *vterm) size() (cols, rows int) { return t.emu.Width(), t.emu.Height() }
+func (t *vterm) resize(cols, rows int)  { t.emu.Resize(cols, rows) }
+
+func (t *vterm) cursor() (x, y int) {
+	p := t.emu.CursorPosition()
+	return p.X, p.Y
+}
+
+// text renders the screen as plain text, one line per row, trailing blanks
+// trimmed.
+func (t *vterm) text() string {
+	lines := strings.Split(t.emu.String(), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " ")
 	}
 	return strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
 }
 
-// screenANSI renders the emulator's screen as escape sequences that
-// repaint a terminal of the same size: what a reattaching client sees.
-// Callers hold the emulator lock.
-func screenANSI(vt vt10x.Terminal) []byte {
-	cols, rows := vt.Size()
+// ansi renders the screen as escape sequences that repaint a terminal of
+// the same size: what a reattaching terminal sees.
+func (t *vterm) ansi() []byte {
 	var b strings.Builder
 	b.WriteString("\x1b[0m\x1b[H\x1b[2J")
-	if vt.Mode()&vt10x.ModeAltScreen != 0 {
+	if t.emu.IsAltScreen() {
 		// Full-screen programs expect the alternate screen; entering it
 		// also means leaving later restores the user's own screen.
 		b.WriteString("\x1b[?1049h\x1b[H\x1b[2J")
 	}
-	var cur vt10x.Glyph
-	cur.FG, cur.BG = vt10x.DefaultFG, vt10x.DefaultBG
-	for y := range rows {
-		fmt.Fprintf(&b, "\x1b[%d;1H", y+1)
-		last := cols
-		for last > 0 && blank(vt.Cell(last-1, y)) {
-			last--
-		}
-		for x := range last {
-			g := vt.Cell(x, y)
-			if g.Mode != cur.Mode || g.FG != cur.FG || g.BG != cur.BG {
-				b.WriteString(sgr(g))
-				cur = g
-			}
-			r := g.Char
-			if r == 0 {
-				r = ' '
-			}
-			b.WriteRune(r)
+	for y, line := range strings.Split(t.emu.Render(), "\n") {
+		fmt.Fprintf(&b, "\x1b[%d;1H%s\x1b[0m", y+1, strings.TrimRight(line, " "))
+	}
+	for _, m := range replayModes {
+		if t.modes[m] {
+			fmt.Fprintf(&b, "\x1b[?%dh", m)
 		}
 	}
-	b.WriteString("\x1b[0m")
-	// Input modes the program set, so keys and the mouse keep working.
-	mode := vt.Mode()
-	for _, m := range []struct {
-		flag vt10x.ModeFlag
-		seq  string
-	}{
-		{vt10x.ModeAppCursor, "\x1b[?1h"},
-		{vt10x.ModeAppKeypad, "\x1b="},
-		{vt10x.ModeMouseButton, "\x1b[?1000h"},
-		{vt10x.ModeMouseMotion, "\x1b[?1002h"},
-		{vt10x.ModeMouseMany, "\x1b[?1003h"},
-		{vt10x.ModeMouseSgr, "\x1b[?1006h"},
-	} {
-		if mode&m.flag != 0 {
-			b.WriteString(m.seq)
-		}
-	}
-	c := vt.Cursor()
-	fmt.Fprintf(&b, "\x1b[%d;%dH", c.Y+1, c.X+1)
-	if vt.CursorVisible() {
+	x, y := t.cursor()
+	fmt.Fprintf(&b, "\x1b[%d;%dH", y+1, x+1)
+	if t.cursorVisible {
 		b.WriteString("\x1b[?25h")
 	} else {
 		b.WriteString("\x1b[?25l")
 	}
 	return []byte(b.String())
-}
-
-func blank(g vt10x.Glyph) bool {
-	return (g.Char == ' ' || g.Char == 0) && g.BG == vt10x.DefaultBG && g.Mode&attrReverse == 0
-}
-
-func sgr(g vt10x.Glyph) string {
-	parts := []string{"0"}
-	if g.Mode&attrBold != 0 {
-		parts = append(parts, "1")
-	}
-	if g.Mode&attrItalic != 0 {
-		parts = append(parts, "3")
-	}
-	if g.Mode&attrUnderline != 0 {
-		parts = append(parts, "4")
-	}
-	if g.Mode&attrBlink != 0 {
-		parts = append(parts, "5")
-	}
-	if g.Mode&attrReverse != 0 {
-		parts = append(parts, "7")
-	}
-	parts = append(parts, colorSGR(g.FG, 38)...)
-	parts = append(parts, colorSGR(g.BG, 48)...)
-	return "\x1b[" + strings.Join(parts, ";") + "m"
-}
-
-func colorSGR(c vt10x.Color, base int) []string {
-	switch {
-	case c >= vt10x.DefaultFG:
-		return nil
-	case c < 256:
-		return []string{strconv.Itoa(base), "5", strconv.Itoa(int(c))}
-	default:
-		return []string{strconv.Itoa(base), "2", strconv.Itoa(int(c >> 16 & 0xff)), strconv.Itoa(int(c >> 8 & 0xff)), strconv.Itoa(int(c & 0xff))}
-	}
 }
 
 // cleanLines turns a stream of terminal output into lines as a person

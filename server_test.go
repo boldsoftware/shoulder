@@ -304,3 +304,44 @@ func TestCode(t *testing.T) {
 		t.Errorf("code %q", c)
 	}
 }
+
+func TestVtermRepaint(t *testing.T) {
+	var replies []string
+	v := newTerm(20, 5, func(b []byte) { replies = append(replies, string(b)) })
+	v.write([]byte("hello \x1b[31mred\x1b[0m\r\n\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[Hfull screen\x1b[3;5H"))
+	if got := v.text(); !strings.HasPrefix(got, "full screen\n") || strings.Contains(got, "hello") {
+		t.Errorf("alt screen text: %q", got)
+	}
+	out := string(v.ansi())
+	for _, want := range []string{"\x1b[?1049h", "full screen", "\x1b[?1h", "\x1b[?2004h", "\x1b[3;5H", "\x1b[?25h"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("repaint lacks %q:\n%q", want, out)
+		}
+	}
+	v.write([]byte("\x1b[?1049l\x1b[?25l"))
+	if got := v.text(); !strings.HasPrefix(got, "hello red\n") {
+		t.Errorf("primary screen text: %q", got)
+	}
+	if out := string(v.ansi()); strings.Contains(out, "\x1b[?1049h") || !strings.Contains(out, "\x1b[31m") || !strings.Contains(out, "\x1b[?25l") {
+		t.Errorf("primary repaint:\n%q", out)
+	}
+}
+
+// A program asking the terminal where the cursor is gets an answer even
+// with no terminal attached, from the emulator.
+func TestQueriesAnsweredWhileDetached(t *testing.T) {
+	cfg, c := testSession(t)
+	rw, err := c.share("unix", false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.post("/ctl/start?cols=80&rows=24"); err != nil {
+		t.Fatal(err)
+	}
+	a := agentFromPaste(t, cfg, rw.Paste)
+	waitUntil(t, "prompt", func() bool { return strings.Contains(a.get("capture-pane"), "$") })
+	code, out := a.call("POST", "run?timeout=10", `printf '\033[6n'; IFS= read -rs -d R pos; echo "cursor-reply:${pos#*[}"`)
+	if code != 200 || !regexp.MustCompile(`cursor-reply:\d+;\d+`).MatchString(out) {
+		t.Errorf("query unanswered: %d\n%s", code, out)
+	}
+}

@@ -18,10 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/hinshun/vt10x"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,9 +42,10 @@ type server struct {
 	mu         sync.Mutex
 	ptmx       *os.File
 	cmd        *exec.Cmd
-	vt         vt10x.Terminal
-	out        []byte // raw output, the most recent maxOutput bytes
-	base       int64  // absolute offset of out[0]
+	vt         *vterm
+	attached   atomic.Int32 // len(clients), readable without mu
+	out        []byte       // raw output, the most recent maxOutput bytes
+	base       int64        // absolute offset of out[0]
 	lastOutput time.Time
 	lastSend   time.Time
 	exited     bool
@@ -145,6 +147,24 @@ func serve(dir string) error {
 	return nil
 }
 
+// quit ends the session: it hangs up on the command, as closing its
+// terminal would, and stops serving without lingering.
+func (s *server) quit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.quitting:
+		return
+	default:
+		close(s.quitting)
+	}
+	if s.cmd != nil && !s.exited {
+		// The command leads its own session (pty.Start setsid), so this
+		// reaches its whole process group.
+		syscall.Kill(-s.cmd.Process.Pid, syscall.SIGHUP)
+	}
+}
+
 // notifyLocked wakes everything waiting for output or a state change.
 func (s *server) notifyLocked() {
 	close(s.changed)
@@ -169,7 +189,14 @@ func (s *server) start(cols, rows int) error {
 		return err
 	}
 	s.cmd, s.ptmx = cmd, ptmx
-	s.vt = vt10x.New(vt10x.WithSize(cols, rows))
+	// With a terminal attached, it answers the program's queries itself;
+	// with none, the emulator's answers stand in, so programs that ask
+	// (where's the cursor? what are you?) don't hang.
+	s.vt = newTerm(cols, rows, func(reply []byte) {
+		if s.attached.Load() == 0 {
+			ptmx.Write(reply)
+		}
+	})
 	go s.readLoop()
 	close(s.started)
 	return nil
@@ -182,7 +209,7 @@ func (s *server) readLoop() {
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			s.mu.Lock()
-			s.vt.Write(data)
+			s.vt.write(data)
 			s.out = append(s.out, data...)
 			if len(s.out) > maxOutput {
 				drop := len(s.out) - maxOutput/2
@@ -190,8 +217,13 @@ func (s *server) readLoop() {
 				s.base += int64(drop)
 			}
 			s.lastOutput = time.Now()
+			left := s.vt.tookLeftAlt()
 			for c := range s.clients {
 				c.send(frameData, data)
+				if left && c.stale {
+					c.send(frameData, s.vt.ansi())
+					c.stale = false
+				}
 			}
 			s.notifyLocked()
 			s.mu.Unlock()
@@ -260,11 +292,11 @@ func (s *server) resizeLocked(cols, rows int) {
 	if s.ptmx == nil || cols <= 0 || rows <= 0 {
 		return
 	}
-	if c, r := s.vt.Size(); c == cols && r == rows {
+	if c, r := s.vt.size(); c == cols && r == rows {
 		return
 	}
 	pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-	s.vt.Resize(cols, rows)
+	s.vt.resize(cols, rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -278,10 +310,14 @@ const (
 )
 
 type client struct {
-	conn net.Conn
-	q    chan []byte
-	cols int
-	rows int
+	// stale: attached during a full-screen program, so the terminal never
+	// saw the screen underneath, and needs it painted when the program
+	// leaves the alternate screen.
+	stale bool
+	conn  net.Conn
+	q     chan []byte
+	cols  int
+	rows  int
 }
 
 // send queues a frame without blocking; a client too slow to keep up is
@@ -347,17 +383,20 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		s.owner = c
 		s.resizeLocked(cols, rows)
 		if r.URL.Query().Get("repaint") != "0" {
-			c.send(frameData, screenANSI(s.vt))
+			c.send(frameData, s.vt.ansi())
+			c.stale = s.vt.altScreen()
 		}
 	}
 	if s.exited {
 		c.send(frameExit, binary.LittleEndian.AppendUint32(nil, uint32(s.exitCode)))
 	}
 	s.clients[c] = true
+	s.attached.Store(int32(len(s.clients)))
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, c)
+		s.attached.Store(int32(len(s.clients)))
 		if s.owner == c {
 			s.owner = nil
 		}
@@ -414,13 +453,7 @@ func (s *server) handler(sh *share) http.Handler {
 		mux.HandleFunc("POST /ctl/start", s.ctlStart)
 		mux.HandleFunc("POST /ctl/share", s.ctlShare)
 		mux.HandleFunc("GET /ctl/info", s.ctlInfo)
-		mux.HandleFunc("POST /ctl/quit", func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case <-s.quitting:
-			default:
-				close(s.quitting)
-			}
-		})
+		mux.HandleFunc("POST /ctl/quit", func(w http.ResponseWriter, r *http.Request) { s.quit() })
 		mux.HandleFunc("GET /ctl/attach", s.handleAttach)
 	}
 	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh) })
@@ -539,7 +572,7 @@ func (s *server) status() status {
 		st.ExitCode = &code
 	}
 	if s.vt != nil {
-		st.Cols, st.Rows = s.vt.Size()
+		st.Cols, st.Rows = s.vt.size()
 	}
 	if !s.lastOutput.IsZero() {
 		st.IdleFor = time.Since(s.lastOutput).Round(100 * time.Millisecond).String()
@@ -610,15 +643,15 @@ func (s *server) getScreen(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	switch r.URL.Query().Get("format") {
 	case "ansi":
-		body = screenANSI(s.vt)
+		body = s.vt.ansi()
 	default:
-		body = []byte(screenText(s.vt))
+		body = []byte(s.vt.text())
 	}
-	c := s.vt.Cursor()
-	cols, rows := s.vt.Size()
+	cx, cy := s.vt.cursor()
+	cols, rows := s.vt.size()
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Cursor", fmt.Sprintf("%d,%d", c.X, c.Y))
+	w.Header().Set("X-Cursor", fmt.Sprintf("%d,%d", cx, cy))
 	w.Header().Set("X-Size", fmt.Sprintf("%dx%d", cols, rows))
 	w.Write(body)
 }
