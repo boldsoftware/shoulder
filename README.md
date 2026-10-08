@@ -4,7 +4,7 @@
 go run github.com/boldsoftware/shoulder@latest
 ```
 
-<human>
+\<human\>
 Shoulder lets an agent look "over your shoulder" at the same terminal session
 you're staring at. 
 
@@ -25,4 +25,4 @@ for making this easy. (Tailcat makes this similar to https://github.com/tmate-io
 or https://upterm.dev/.)
 
 The implementation is vibe-coded.
-</human>
+\</human\>
