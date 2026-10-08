@@ -1,0 +1,53 @@
+name: Release
+
+# Every commit on main that passes Test becomes a release.
+on:
+  workflow_run:
+    workflows: ["Test"]
+    branches:
+      - main
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Tag the release
+        run: |
+          # v0.<commit count>.9<short sha in octal>: increasing, and traceable
+          # to a commit. The leading 9 keeps the patch a valid semver number.
+          COUNT=$(git rev-list --count HEAD)
+          SHORT_SHA=$(git rev-parse --short=6 HEAD)
+          SHA_OCTAL=$(printf '%o' "0x${SHORT_SHA}")
+          TAG="v0.${COUNT}.9${SHA_OCTAL}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG} (${SHORT_SHA})"
+          git push origin "${TAG}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

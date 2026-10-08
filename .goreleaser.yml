@@ -1,0 +1,68 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: shoulder
+    binary: shoulder
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: shoulder
+    formats:
+      - binary
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'typo'
+
+release:
+  github:
+    owner: boldsoftware
+    name: shoulder
+  draft: false
+  prerelease: auto
+
+homebrew_casks:
+  - name: shoulder
+    binaries:
+      - shoulder
+    repository:
+      owner: boldsoftware
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/boldsoftware/shoulder
+    description: "Share a terminal session with an agent"
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{caskroom_path}"]

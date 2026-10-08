@@ -45,6 +45,9 @@ import (
 	"golang.org/x/term"
 )
 
+// version is set at release time (see .goreleaser.yml).
+var version = "dev"
+
 func main() {
 	var err error
 	args := os.Args[1:]
@@ -61,6 +64,8 @@ func main() {
 		err = shareCmd(args[1:])
 	case "ls":
 		err = listCmd()
+	case "version", "-version", "--version":
+		fmt.Println("shoulder", version)
 	default:
 		err = run(args)
 	}
