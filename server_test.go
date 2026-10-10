@@ -7,11 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +21,7 @@ import (
 
 // testSession runs a session server with bash in it and returns its
 // control client.
-func testSession(t *testing.T) (*config, *ctl) {
+func testSession(t *testing.T, readOnly bool) (*config, *ctl) {
 	t.Helper()
 	bash, err := exec.LookPath("bash")
 	if err != nil {
@@ -32,7 +34,7 @@ func testSession(t *testing.T) (*config, *ctl) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	cfg := &config{Name: "test-session", Dir: dir, Command: []string{bash, "--norc", "--noprofile", "-i"},
-		Cwd: dir, Host: "testhost", Linger: time.Minute}
+		Cwd: dir, Host: "testhost", Linger: time.Minute, ReadOnly: readOnly}
 	b, _ := json.Marshal(cfg)
 	os.WriteFile(cfg.path("config.json"), b, 0o600)
 	os.Setenv("PS1", "$ ")
@@ -95,6 +97,16 @@ func (a *agentClient) call(method, endpoint, body string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
+// shareList is the session's open shares, as /ctl/info reports them.
+func shareList(t *testing.T, c *ctl) []string {
+	t.Helper()
+	v, err := c.info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.Shares
+}
+
 func (a *agentClient) get(endpoint string) string {
 	a.t.Helper()
 	code, body := a.call("GET", endpoint, "")
@@ -105,13 +117,15 @@ func (a *agentClient) get(endpoint string) string {
 }
 
 func TestSessionAPI(t *testing.T) {
-	cfg, c := testSession(t)
-	rw, err := c.share("unix", false, true)
+	cfg, c := testSession(t, false)
+	rw, err := c.share("unix", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(rw.Paste, "\n") > 0 || !regexp.MustCompile(`/\d+-[a-z]+-[a-z]+/$`).MatchString(rw.Paste) {
-		t.Errorf("paste should be one line ending in the code:\n%s", rw.Paste)
+	// The unix socket has no codes: the paste is one line reaching the API
+	// at the socket's root.
+	if strings.Count(rw.Paste, "\n") > 0 || codeRE.MatchString(rw.Paste) || !strings.HasSuffix(rw.Paste, " http://shoulder/") {
+		t.Errorf("unix paste should be one line with no code:\n%s", rw.Paste)
 	}
 	if _, err := c.post("/ctl/start?cols=80&rows=24"); err != nil {
 		t.Fatal(err)
@@ -156,27 +170,19 @@ func TestSessionAPI(t *testing.T) {
 		t.Errorf("status: %+v", st)
 	}
 
-	// A read-only token can look but not type.
-	ro, err := c.share("unix", true, false)
-	if err != nil {
-		t.Fatal(err)
+	// The unix socket has no read-only access, and no codes: a code-shaped
+	// path on it is just an unknown endpoint.
+	if _, err := c.share("unix", true); err == nil {
+		t.Error("read-only unix share accepted")
 	}
-	r := agentFromPaste(t, cfg, ro.Paste)
-	if g := r.get(""); strings.Contains(g, "send-keys") || !strings.Contains(g, "read-only") {
-		t.Errorf("read-only guide offers typing:\n%s", g)
-	}
-	if code, _ := r.call("POST", "send-keys", "'echo nope' Enter"); code != http.StatusForbidden {
-		t.Errorf("read-only send: %d", code)
-	}
-	if s := r.get("capture-pane"); !strings.Contains(s, "after") {
-		t.Errorf("read-only screen:\n%s", s)
-	}
-	if code, _ := a.call("GET", "../nope/screen", ""); code == 200 {
-		t.Error("bad token accepted")
+	if code, _ := a.call("GET", newCode()+"/status", ""); code != http.StatusNotFound {
+		t.Errorf("code on the unix socket: %d", code)
 	}
 
-	// localhost serves the same session over TCP.
-	lh, err := c.share("localhost", false, false)
+	// localhost serves the same session over TCP, with its own two codes:
+	// the read-only one can look but not type, the read-write one can do
+	// both, and handing out either leaves the other as it was.
+	lh, err := c.share("localhost", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,19 +190,56 @@ func TestSessionAPI(t *testing.T) {
 	if !strings.HasPrefix(l.base, "http://127.0.0.1:") {
 		t.Errorf("localhost base %s", l.base)
 	}
+	if g := l.get(""); strings.Contains(g, "send-keys") || !strings.Contains(g, "read-only") {
+		t.Errorf("read-only guide offers typing:\n%s", g)
+	}
 	if s := l.get("capture-pane"); !strings.Contains(s, "after") {
 		t.Errorf("localhost screen:\n%s", s)
 	}
-	// Wrong codes on a network share lock it, even against the right code.
-	bad := &agentClient{t: t, http: l.http, base: strings.TrimSuffix(l.base, path.Base(l.base)) + "1-not-it"}
-	for range maxFails {
-		bad.call("GET", "status", "")
+	if code, _ := l.call("POST", "send-keys", "'echo nope' Enter"); code != http.StatusForbidden {
+		t.Errorf("localhost read-only send: %d", code)
 	}
-	if code, _ := l.call("GET", "status", ""); code != http.StatusTooManyRequests {
-		t.Errorf("after %d wrong codes, the right one got %d; want 429", maxFails, code)
+	lrw, err := c.share("localhost", false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s := a.get("capture-pane"); !strings.Contains(s, "after") {
-		t.Errorf("localhost screen:\n%s", s)
+	if lrw.ReadOnly || lrw.Paste == lh.Paste {
+		t.Errorf("read-write paste %q, read-only paste %q", lrw.Paste, lh.Paste)
+	}
+	lw := agentFromPaste(t, cfg, lrw.Paste)
+	if code, out := lw.call("POST", "run?timeout=10", "echo localhost-$((20+2))"); code != 200 || !strings.Contains(out, "localhost-22") {
+		t.Errorf("localhost run: %d\n%s", code, out)
+	}
+	if s := l.get("capture-pane"); !strings.Contains(s, "localhost-22") {
+		t.Errorf("read-only code after the read-write one was handed out:\n%s", s)
+	}
+	if again, err := c.share("localhost", true); err != nil || again.Paste != lh.Paste {
+		t.Errorf("read-only paste changed: %q, %v", again.Paste, err)
+	}
+	if shares := shareList(t, c); !slices.Equal(shares, []string{"localhost", "unix"}) {
+		t.Errorf("shares: %v", shares)
+	}
+	// A wrong code is refused, and the right one keeps working.
+	lroot := strings.TrimSuffix(l.base, path.Base(l.base))
+	bad := &agentClient{t: t, http: l.http, base: lroot + "NOTACODE"}
+	if code, _ := bad.call("GET", "status", ""); code != http.StatusForbidden {
+		t.Errorf("wrong code: %d", code)
+	}
+	if code, _ := l.call("GET", "status", ""); code != 200 {
+		t.Errorf("right code after a wrong one: %d", code)
+	}
+	// Unsharing closes the listener. The unix socket can't be unshared.
+	if _, err := c.post("/ctl/unshare?transport=localhost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.http.Get(l.base + "/status"); err == nil {
+		t.Error("localhost still answers after unshare")
+	}
+	if shares := shareList(t, c); !slices.Equal(shares, []string{"unix"}) {
+		t.Errorf("shares after unshare: %v", shares)
+	}
+	if _, err := c.post("/ctl/unshare?transport=unix"); err == nil {
+		t.Error("unix socket unshared")
 	}
 
 	// A terminal attaching gets the screen repainted.
@@ -236,6 +279,87 @@ func TestSessionAPI(t *testing.T) {
 	json.Unmarshal([]byte(a.get("status")), &st)
 	if st.Running || st.ExitCode == nil || *st.ExitCode != 3 {
 		t.Errorf("status after exit: %+v", st)
+	}
+}
+
+// A read-only session never has a code that can type: a network share
+// answers with its read-only code whatever is asked for. The unix socket
+// has no codes and types as always.
+func TestReadOnlySession(t *testing.T) {
+	cfg, c := testSession(t, true)
+	if _, err := c.post("/ctl/start?cols=80&rows=24"); err != nil {
+		t.Fatal(err)
+	}
+	u, err := c.share("unix", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentFromPaste(t, cfg, u.Paste)
+	waitUntil(t, "prompt", func() bool { return strings.Contains(a.get("capture-pane"), "$") })
+	if code, out := a.call("POST", "run?timeout=10", "echo unix-$((40+2))"); code != 200 || !strings.Contains(out, "unix-42") {
+		t.Errorf("unix run: %d\n%s", code, out)
+	}
+	rw, err := c.share("localhost", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro, err := c.share("localhost", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rw.ReadOnly || rw.Paste != ro.Paste {
+		t.Errorf("asked for read-write, got %+v; read-only is %+v", rw, ro)
+	}
+	l := agentFromPaste(t, cfg, rw.Paste)
+	if g := l.get(""); strings.Contains(g, "send-keys") || !strings.Contains(g, "read-only") {
+		t.Errorf("guide offers typing:\n%s", g)
+	}
+	if s := l.get("capture-pane"); !strings.Contains(s, "unix-42") {
+		t.Errorf("screen:\n%s", s)
+	}
+	if code, _ := l.call("POST", "send-keys", "'echo nope' Enter"); code != http.StatusForbidden {
+		t.Errorf("send on a read-only session: %d", code)
+	}
+	var st status
+	json.Unmarshal([]byte(l.get("status")), &st)
+	if !st.ReadOnly {
+		t.Errorf("status: %+v", st)
+	}
+}
+
+// In a read-only session a network share refuses to type whatever the
+// code, even one that would type in a read-write session.
+func TestReadOnlySessionRefusesTyping(t *testing.T) {
+	s := &server{cfg: &config{ReadOnly: true}}
+	sh := &share{transport: "localhost", ro: newCode(), rw: newCode(), curl: "curl -s", base: "http://x"}
+	srv := httptest.NewServer(s.handler(sh))
+	defer srv.Close()
+	a := &agentClient{t: t, http: srv.Client(), base: srv.URL + "/" + sh.rw}
+	if g := a.get(""); strings.Contains(g, "send-keys") || !strings.Contains(g, "read-only") {
+		t.Errorf("guide offers typing:\n%s", g)
+	}
+	for _, endpoint := range []string{"send-keys", "run"} {
+		if code, _ := a.call("POST", endpoint, "Enter"); code != http.StatusForbidden {
+			t.Errorf("%s with the read-write code: %d", endpoint, code)
+		}
+	}
+}
+
+// A share's codes work only on it, and a code that isn't set, like the
+// read-write code of a read-only session's share, matches nothing.
+func TestAccess(t *testing.T) {
+	a := &share{ro: newCode(), rw: newCode()}
+	b := &share{ro: newCode()}
+	if ro, ok := a.access(a.rw); !ok || ro {
+		t.Errorf("read-write code on its share: readOnly=%v ok=%v", ro, ok)
+	}
+	if ro, ok := a.access(a.ro); !ok || !ro {
+		t.Errorf("read-only code on its share: readOnly=%v ok=%v", ro, ok)
+	}
+	for _, code := range []string{a.ro, a.rw, "", "NOTACODE"} {
+		if _, ok := b.access(code); ok {
+			t.Errorf("%q accepted on another share", code)
+		}
 	}
 }
 
@@ -296,12 +420,21 @@ func TestSendKeysBytes(t *testing.T) {
 	}
 }
 
+// codeRE matches a code at the end of a paste: 26 or more base32
+// characters, which is how crypto/rand.Text spells at least 128 bits.
+var codeRE = regexp.MustCompile(`/[A-Z2-7]{26,}/$`)
+
 func TestCode(t *testing.T) {
-	if len(codeWords) != 256 {
-		t.Errorf("%d code words; want 256", len(codeWords))
-	}
-	if c := newCode(); !regexp.MustCompile(`^\d{1,2}-[a-z]+-[a-z]+$`).MatchString(c) {
-		t.Errorf("code %q", c)
+	seen := map[string]bool{}
+	for range 100 {
+		c := newCode()
+		if !codeRE.MatchString("/" + c + "/") {
+			t.Errorf("code %q", c)
+		}
+		if seen[c] {
+			t.Errorf("code %q repeated", c)
+		}
+		seen[c] = true
 	}
 }
 
@@ -330,8 +463,8 @@ func TestVtermRepaint(t *testing.T) {
 // A program asking the terminal where the cursor is gets an answer even
 // with no terminal attached, from the emulator.
 func TestQueriesAnsweredWhileDetached(t *testing.T) {
-	cfg, c := testSession(t)
-	rw, err := c.share("unix", false, true)
+	cfg, c := testSession(t, false)
+	rw, err := c.share("unix", false)
 	if err != nil {
 		t.Fatal(err)
 	}

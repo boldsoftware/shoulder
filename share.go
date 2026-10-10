@@ -1,7 +1,9 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +14,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -31,62 +32,48 @@ var transports = []struct {
 	{"tailcat", "t", "tailcat"},
 }
 
-// share is one way into the agent API.
+// share is one way into the agent API. A network share has its own codes,
+// fixed when it opens: a read-only one, and a read-write one unless the
+// session is read-only. A code never works on a share it wasn't issued
+// for. The session's own Unix socket has no codes: file permissions
+// protect it, and whoever can reach it controls the session (the control
+// API is there too), so it has no read-only access either.
 type share struct {
-	mu     sync.Mutex
-	fails  []time.Time // recent wrong codes
-	locked time.Time   // wrong codes are refused until then
+	ro string // code that can watch; empty on the unix socket, which has none
+	rw string // code that can also type; empty in a read-only session, and on the unix socket
 
 	transport string
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
 	base      string // URL the paths hang off, e.g. "http://127.0.0.1:7357"
 	warning   string // a risk the user should know about
-	note      string // how the agent's side works
+	note      string // how the share works, for the user
 	ln        net.Listener
 	srv       *http.Server
 	tc        *tailcat.Server // when tailcat carries the share
 }
 
-func (sh *share) url(token string) string { return sh.base + "/" + token }
-
-// Codes are short enough to guess, so a network share that sees too many
-// wrong ones stops answering for a while: 10 guesses per 10 minutes makes
-// finding one of ~6.5M codes take years. The session's own Unix socket is
-// protected by file permissions instead.
-const (
-	maxFails   = 10
-	failWindow = 10 * time.Minute
-)
-
-func (sh *share) failed() {
-	if sh.transport == "unix" {
-		return
+// url is where the agent API hangs off: base/token, or base alone on the
+// unix socket, which has no codes.
+func (sh *share) url(token string) string {
+	if token == "" {
+		return sh.base
 	}
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	now := time.Now()
-	recent := sh.fails[:0]
-	for _, t := range sh.fails {
-		if now.Sub(t) < failWindow {
-			recent = append(recent, t)
-		}
-	}
-	sh.fails = append(recent, now)
-	if len(sh.fails) >= maxFails {
-		sh.locked = now.Add(failWindow)
-		sh.fails = nil
-		log.Printf("%s share: %d wrong codes; locked until %s", sh.transport, maxFails, sh.locked.Format(time.TimeOnly))
-	}
+	return sh.base + "/" + token
 }
 
-// lockedUntil is when a lock ends, or zero if the share isn't locked.
-func (sh *share) lockedUntil() time.Time {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if time.Now().Before(sh.locked) {
-		return sh.locked
+// access says what a code is good for on this share. Codes are long enough
+// that guessing is hopeless at any rate, so there is no rate limit; the
+// comparison takes constant time, so a wrong code learns nothing from how
+// long the answer took. A code that isn't set matches nothing, not even an
+// empty string.
+func (sh *share) access(code string) (readOnly, ok bool) {
+	switch {
+	case sh.rw != "" && subtle.ConstantTimeCompare([]byte(code), []byte(sh.rw)) == 1:
+		return false, true
+	case sh.ro != "" && subtle.ConstantTimeCompare([]byte(code), []byte(sh.ro)) == 1:
+		return true, true
 	}
-	return time.Time{}
+	return false, false
 }
 
 func (sh *share) close() {
@@ -98,30 +85,48 @@ func (sh *share) close() {
 	}
 }
 
+// openShare sets up a share: its listener, its codes, and then, with the
+// codes in place, its server. The unix socket is the session's own, served
+// by serve, and gets no codes.
 func openShare(ctx context.Context, s *server, transport string) (*share, error) {
+	var sh *share
+	var err error
 	switch transport {
 	case "unix":
-		// The session's own socket; always open.
-		return &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder"}, nil
+		sh = &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder",
+			note: "Access to the socket grants full control of the session."}
 	case "localhost":
-		return listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
+		sh, err = listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
 	case "lan":
 		host := lanAddress()
-		return listenShare(s, transport, "", host,
+		sh, err = listenShare(s, transport, "", host,
 			"Listening on every interface over plain HTTP: anyone who can reach this machine and has the URL can use the session.")
 	case "tailscale":
-		ip, name, err := tailscaleAddress(ctx)
-		if err != nil {
+		var ip, name string
+		if ip, name, err = tailscaleAddress(ctx); err != nil {
 			return nil, err
 		}
-		return listenShare(s, transport, ip, cmpOr(name, ip), "")
+		sh, err = listenShare(s, transport, ip, cmp.Or(name, ip), "")
 	case "tailcat":
-		return tailcatShare(ctx, s)
+		sh, err = tailcatShare(ctx, s)
+	default:
+		return nil, fmt.Errorf("unknown transport %q", transport)
 	}
-	return nil, fmt.Errorf("unknown transport %q", transport)
+	if err != nil {
+		return nil, err
+	}
+	if sh.transport != "unix" {
+		sh.ro = newCode()
+		if !s.cfg.ReadOnly {
+			sh.rw = newCode()
+		}
+		sh.srv = &http.Server{Handler: s.handler(sh)}
+		go sh.srv.Serve(sh.ln)
+	}
+	return sh, nil
 }
 
-// listenShare serves the agent API on bind:port, reachable as host:port.
+// listenShare listens for the agent API on bind:port, reachable as host:port.
 func listenShare(s *server, transport, bind, host, warning string) (*share, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(bind, strconv.Itoa(s.cfg.Port)))
 	if err != nil && s.cfg.Port != 0 {
@@ -131,10 +136,7 @@ func listenShare(s *server, transport, bind, host, warning string) (*share, erro
 		return nil, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	sh := &share{transport: transport, curl: "curl -s", base: "http://" + net.JoinHostPort(host, strconv.Itoa(port)), warning: warning, ln: ln}
-	sh.srv = &http.Server{Handler: s.handler(sh)}
-	go sh.srv.Serve(ln)
-	return sh, nil
+	return &share{transport: transport, curl: "curl -s", base: "http://" + net.JoinHostPort(host, strconv.Itoa(port)), warning: warning, ln: ln}, nil
 }
 
 // lanAddress is this machine's address on its primary network.
@@ -214,25 +216,26 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 	}
 	region := pick.Region[0]
 	priv := key.NewNode()
-	tc := &tailcat.Server{Key: priv, DisablePresharedKey: true, Region: region, Logf: logf}
+	psk := tailcat.NewPresharedKey()
+	tc := &tailcat.Server{Key: priv, PresharedKey: psk, Region: region, Logf: logf}
 	ln, err := tc.Listen(ctx, "tcp", ":80")
 	if err != nil {
 		tc.Close()
 		return nil, fmt.Errorf("tailcat: %w", err)
 	}
-	// The shortest address current clients accept: no pre-shared key (the
-	// access code guards the session; WireGuard still encrypts), and the
-	// relay named by region ID.
+	// The address names the relay by region ID to stay short, and carries
+	// the pre-shared key: it keeps anyone who learns the node key, such as
+	// the relay operator, from joining the tunnel, and keeps a recording of
+	// the traffic confidential against a future quantum computer. The
+	// address is a secret, like the code it comes with.
 	ci := tailcat.ConnInfo{
 		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+		PresharedKey:      psk,
 		RegionID:          region.RegionID,
 	}
-	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
-	sh.srv = &http.Server{Handler: s.handler(sh)}
-	go sh.srv.Serve(ln)
-	return sh, nil
+	return &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
+		note: "The agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}, nil
 }
 
 func shellQuote(s string) string {
@@ -251,11 +254,4 @@ func shellPath(path string) string {
 		return t
 	}
 	return shellQuote(path)
-}
-
-func cmpOr(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }

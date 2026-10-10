@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,8 +35,6 @@ import (
 // API; shares add more listeners for the agent API only.
 type server struct {
 	cfg      *config
-	rwToken  string
-	roToken  string
 	ctlSock  string
 	started  chan struct{}
 	quitting chan struct{}
@@ -70,7 +70,8 @@ type config struct {
 	Started  time.Time     `json:"started"`
 	Linger   time.Duration `json:"linger"`
 	Port     int           `json:"port"`
-	Host     string        `json:"host"` // this machine's name, for agents' context
+	Host     string        `json:"host"`      // this machine's name, for agents' context
+	ReadOnly bool          `json:"read_only"` // never make a code that can type: agents over the network only watch
 	Attached bool          `json:"-"`
 }
 
@@ -88,17 +89,12 @@ func serve(dir string) error {
 	}
 	s := &server{
 		cfg:      cfg,
-		rwToken:  newCode(),
-		roToken:  newCode(),
 		ctlSock:  cfg.path("sock"),
 		started:  make(chan struct{}),
 		quitting: make(chan struct{}),
 		changed:  make(chan struct{}),
 		clients:  map[*client]bool{},
 		shares:   map[string]*share{},
-	}
-	for s.roToken == s.rwToken {
-		s.roToken = newCode()
 	}
 	os.Remove(s.ctlSock)
 	ln, err := net.Listen("unix", s.ctlSock)
@@ -107,8 +103,10 @@ func serve(dir string) error {
 	}
 	defer os.Remove(s.ctlSock)
 	os.Chmod(s.ctlSock, 0o600)
-	unixShare, _ := openShare(context.Background(), s, "unix")
-	s.shares["unix"] = unixShare
+	unixShare, err := s.share(context.Background(), "unix")
+	if err != nil {
+		return err
+	}
 	srv := &http.Server{Handler: s.handler(unixShare)}
 	go srv.Serve(ln)
 
@@ -445,18 +443,32 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // HTTP.
 
-// handler serves the agent API under /<token>/ for a share, and, on the
-// session's own socket only, the control API under /ctl/.
+// handler serves a share's agent API: under /<code>/ on a network share,
+// and at the root of the session's own socket, which has no codes and also
+// carries the control API under /ctl/.
 func (s *server) handler(sh *share) http.Handler {
 	mux := http.NewServeMux()
 	if sh.transport == "unix" {
 		mux.HandleFunc("POST /ctl/start", s.ctlStart)
 		mux.HandleFunc("POST /ctl/share", s.ctlShare)
+		mux.HandleFunc("POST /ctl/unshare", s.ctlUnshare)
 		mux.HandleFunc("GET /ctl/info", s.ctlInfo)
 		mux.HandleFunc("POST /ctl/quit", func(w http.ResponseWriter, r *http.Request) { s.quit() })
 		mux.HandleFunc("GET /ctl/attach", s.handleAttach)
+		mux.HandleFunc("/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh, "", false) })
+		return mux
 	}
-	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh) })
+	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		token := r.PathValue("token")
+		readOnly, ok := sh.access(token)
+		if !ok {
+			http.Error(w, "unknown code", http.StatusForbidden)
+			return
+		}
+		// A read-only session has no read-write code, and would not honor
+		// one.
+		s.agent(w, r, sh, token, readOnly || s.cfg.ReadOnly)
+	})
 	return mux
 }
 
@@ -480,64 +492,85 @@ type shareInfo struct {
 	Note      string `json:"note,omitempty"`
 }
 
+// infoReply is what /ctl/info reports: the session's status and its open
+// shares.
+type infoReply struct {
+	Status status   `json:"status"`
+	Shares []string `json:"shares"`
+}
+
+// ctlShare opens a share if need be and answers with the paste for the
+// access asked for. The unix socket has no codes and no read-only access.
+// In a read-only session there is no read-write code, so the answer is
+// read-only whatever was asked for.
 func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	transport := q.Get("transport")
 	readOnly := q.Get("read_only") == "1"
-	exclusive := q.Get("exclusive") == "1"
-	sh, err := s.share(r.Context(), transport, exclusive)
+	if transport == "unix" && readOnly {
+		http.Error(w, "the unix socket has no read-only access: anyone who can reach it controls the session", http.StatusBadRequest)
+		return
+	}
+	sh, err := s.share(r.Context(), transport)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	token := s.rwToken
-	if readOnly {
-		token = s.roToken
+	code := ""
+	if transport != "unix" {
+		readOnly = readOnly || s.cfg.ReadOnly
+		code = sh.rw
+		if readOnly {
+			code = sh.ro
+		}
 	}
-	writeJSON(w, shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, token, readOnly), Warning: sh.warning, Note: sh.note})
+	writeJSON(w, shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, code, readOnly), Warning: sh.warning, Note: sh.note})
 }
 
 // share returns the listener for transport, setting it up if need be.
-// With exclusive, other network shares are closed: the launcher's menu
-// switches between them.
-func (s *server) share(ctx context.Context, transport string, exclusive bool) (*share, error) {
+func (s *server) share(ctx context.Context, transport string) (*share, error) {
 	s.mu.Lock()
-	if exclusive {
-		for name, sh := range s.shares {
-			if name != transport && name != "unix" {
-				sh.close()
-				delete(s.shares, name)
-			}
-		}
-	}
-	if sh := s.shares[transport]; sh != nil {
-		s.mu.Unlock()
+	sh := s.shares[transport]
+	s.mu.Unlock()
+	if sh != nil {
 		return sh, nil
 	}
-	s.mu.Unlock()
-	sh, err := openShare(ctx, s, transport)
+	opened, err := openShare(ctx, s, transport)
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if old := s.shares[transport]; old != nil {
-		sh.close()
-		return old, nil
+	if sh := s.shares[transport]; sh != nil {
+		opened.close() // opened twice at once; the first one stays
+		return sh, nil
 	}
-	s.shares[transport] = sh
-	return sh, nil
+	s.shares[transport] = opened
+	return opened, nil
+}
+
+// ctlUnshare closes a network share. The launcher's menu switches between
+// transports by opening the new one and then closing the one it was on.
+func (s *server) ctlUnshare(w http.ResponseWriter, r *http.Request) {
+	transport := r.URL.Query().Get("transport")
+	if transport == "unix" {
+		http.Error(w, "the unix socket is the session's own and stays open", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	sh := s.shares[transport]
+	delete(s.shares, transport)
+	s.mu.Unlock()
+	if sh != nil {
+		sh.close()
+	}
 }
 
 func (s *server) ctlInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	var shares []string
-	for name := range s.shares {
-		shares = append(shares, name)
-	}
+	shares := slices.Sorted(maps.Keys(s.shares))
 	s.mu.Unlock()
-	st := s.status()
-	writeJSON(w, map[string]any{"status": st, "shares": shares})
+	writeJSON(w, infoReply{Status: s.status(), Shares: shares})
 }
 
 type status struct {
@@ -587,23 +620,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc.Encode(v)
 }
 
-// agent serves the agent API: /<code>/<endpoint>.
-func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share) {
-	if until := sh.lockedUntil(); !until.IsZero() {
-		http.Error(w, "too many wrong codes; this share is locked until "+until.Format("15:04:05"), http.StatusTooManyRequests)
-		return
-	}
-	var readOnly bool
-	switch r.PathValue("token") {
-	case s.rwToken:
-	case s.roToken:
-		readOnly = true
-	default:
-		sh.failed()
-		http.Error(w, "unknown code", http.StatusForbidden)
-		return
-	}
-	token := r.PathValue("token")
+// agent serves the agent API: /<code>/<endpoint> on a network share, or
+// /<endpoint> on the unix socket, where token is empty.
+func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share, token string, readOnly bool) {
 	switch rest := r.PathValue("rest"); {
 	case rest == "" && r.Method == "GET":
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
