@@ -122,7 +122,7 @@ func TestSessionAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(rw.Paste, "\n") > 0 || !regexp.MustCompile(`/\d+-[a-z]+-[a-z]+/$`).MatchString(rw.Paste) {
+	if strings.Count(rw.Paste, "\n") > 0 || !codeRE.MatchString(rw.Paste) {
 		t.Errorf("paste should be one line ending in the code:\n%s", rw.Paste)
 	}
 	if _, err := c.post("/ctl/start?cols=80&rows=24"); err != nil {
@@ -343,12 +343,21 @@ func TestSendKeysBytes(t *testing.T) {
 	}
 }
 
+// codeRE matches a code at the end of a paste: 26 or more base32
+// characters, which is how crypto/rand.Text spells at least 128 bits.
+var codeRE = regexp.MustCompile(`/[A-Z2-7]{26,}/$`)
+
 func TestCode(t *testing.T) {
-	if len(codeWords) != 256 {
-		t.Errorf("%d code words; want 256", len(codeWords))
-	}
-	if c := newCode(); !regexp.MustCompile(`^\d{1,2}-[a-z]+-[a-z]+$`).MatchString(c) {
-		t.Errorf("code %q", c)
+	seen := map[string]bool{}
+	for range 100 {
+		c := newCode()
+		if !codeRE.MatchString("/" + c + "/") {
+			t.Errorf("code %q", c)
+		}
+		if seen[c] {
+			t.Errorf("code %q repeated", c)
+		}
+		seen[c] = true
 	}
 }
 
