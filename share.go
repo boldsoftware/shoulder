@@ -33,26 +33,36 @@ var transports = []struct {
 	{"tailcat", "t", "tailcat"},
 }
 
-// share is one way into the agent API. Each share has its own codes: a
-// read-only one from the start, and a read-write one only once read-write
-// access is asked for on it. A share only ever shared read-only has no code
-// that can type, and a code never works on a share it wasn't issued for.
+// share is one way into the agent API. Each network share has its own
+// codes: a read-only one from the start, and a read-write one only once
+// read-write access is asked for on it. A share only ever shared read-only
+// has no code that can type, and a code never works on a share it wasn't
+// issued for. The session's own Unix socket has no codes: file permissions
+// protect it, and whoever can reach it controls the session (the control
+// API is there too), so it has no read-only access either.
 type share struct {
 	mu sync.Mutex
-	ro string // code that can watch
+	ro string // code that can watch; empty on the unix socket, which has none
 	rw string // code that can also type; empty until asked for
 
 	transport string
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
 	base      string // URL the paths hang off, e.g. "http://127.0.0.1:7357"
 	warning   string // a risk the user should know about
-	note      string // how the agent's side works
+	note      string // how the share works, for the user
 	ln        net.Listener
 	srv       *http.Server
 	tc        *tailcat.Server // when tailcat carries the share
 }
 
-func (sh *share) url(token string) string { return sh.base + "/" + token }
+// url is where the agent API hangs off: base/token, or base alone on the
+// unix socket, which has no codes.
+func (sh *share) url(token string) string {
+	if token == "" {
+		return sh.base
+	}
+	return sh.base + "/" + token
+}
 
 // access says what a code is good for on this share. Codes are long enough
 // that guessing is hopeless at any rate, so there is no rate limit; the
@@ -71,11 +81,12 @@ func (sh *share) access(code string) (readOnly, ok bool) {
 	return false, false
 }
 
-// readWrite reports whether the share has a read-write code.
+// readWrite reports whether the share gives read-write access: a network
+// share does once it has a read-write code, the unix socket always.
 func (sh *share) readWrite() bool {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	return sh.rw != ""
+	return sh.transport == "unix" || sh.rw != ""
 }
 
 func (sh *share) close() {
@@ -88,14 +99,15 @@ func (sh *share) close() {
 }
 
 // openShare sets up a share: its listener, its read-only code, and then,
-// with the code in place, its server.
+// with the code in place, its server. The unix socket is the session's own,
+// served by serve, and gets no code.
 func openShare(ctx context.Context, s *server, transport string) (*share, error) {
 	var sh *share
 	var err error
 	switch transport {
 	case "unix":
-		// The session's own socket, which serve listens on; always open.
-		sh = &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder"}
+		sh = &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder",
+			note: "Anyone who can reach the socket controls the session: file permissions protect it, not codes, and it has no read-only access."}
 	case "localhost":
 		sh, err = listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
 	case "lan":
@@ -116,8 +128,8 @@ func openShare(ctx context.Context, s *server, transport string) (*share, error)
 	if err != nil {
 		return nil, err
 	}
-	sh.ro = newCode()
-	if sh.ln != nil {
+	if sh.transport != "unix" {
+		sh.ro = newCode()
 		sh.srv = &http.Server{Handler: s.handler(sh)}
 		go sh.srv.Serve(sh.ln)
 	}

@@ -15,9 +15,11 @@
 // interfaces, [s] this machine's Tailscale address, or [t] an ephemeral
 // tailcat node, which reaches across networks with nothing but the
 // tailcat binary on the other side. [r] switches between read-write and
-// read-only access. Each share has its own codes: a read-only one, and a
-// read-write one only once read-write access is asked for on it, so a
-// share only ever shared read-only has no code that can type.
+// read-only access. Each network share has its own codes: a read-only one,
+// and a read-write one only once read-write access is asked for on it, so a
+// share only ever shared read-only has no code that can type. The Unix
+// socket has no codes: file permissions protect it, and anyone who can
+// reach it controls the session, so it has no read-only access either.
 package main
 
 import (
@@ -99,7 +101,7 @@ flags:
 		fs.PrintDefaults()
 	}
 	transport := fs.String("t", "unix", "how agents connect: unix, localhost, lan (all interfaces), tailscale, tailcat")
-	readOnly := fs.Bool("read-only", false, "share read-only access (agents can watch but not type)")
+	readOnly := fs.Bool("read-only", false, "share read-only access (agents can watch but not type; not over the unix socket)")
 	yes := fs.Bool("y", false, "skip the first screen: share, print the paste text, and start")
 	port := fs.Int("port", 0, "TCP port for localhost/lan/tailscale/tailcat shares (default: any free port)")
 	name := fs.String("name", "", "session name (default: two random words)")
@@ -279,6 +281,9 @@ func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), old)
 	in := bufio.NewReader(os.Stdin)
+	// readOnly is the access asked for on transports that offer the choice;
+	// it survives a hop through the unix socket, which has none.
+	readOnly := info.ReadOnly
 	note := ""
 	for {
 		drawFirstScreen(cfg, info, note)
@@ -306,12 +311,13 @@ func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
 				note = err.Error()
 			} else {
 				info = next
+				readOnly = info.ReadOnly
 			}
 		default:
 			for _, tr := range transports {
 				if string(k) == tr.key && tr.name != info.Transport {
 					drawFirstScreen(cfg, info, "setting up "+tr.label+"…")
-					next, err := c.share(tr.name, info.ReadOnly, true)
+					next, err := c.share(tr.name, readOnly && tr.name != "unix", true)
 					if err != nil {
 						note = err.Error()
 					} else {
@@ -351,15 +357,19 @@ func drawFirstScreen(cfg *config, info shareInfo, note string) {
 		p("%s  ", label)
 	}
 	p("\n%saccess%s ", bold, reset)
-	for _, ro := range []bool{false, true} {
-		label := "[r] read-write"
-		if ro {
-			label = "[r] read-only"
+	if info.Transport == "unix" {
+		p("read-write")
+	} else {
+		for _, ro := range []bool{false, true} {
+			label := "[r] read-write"
+			if ro {
+				label = "[r] read-only"
+			}
+			if ro == info.ReadOnly {
+				label = rev + label + reset
+			}
+			p("%s  ", label)
 		}
-		if ro == info.ReadOnly {
-			label = rev + label + reset
-		}
-		p("%s  ", label)
 	}
 	p("\n")
 	p("\n%s[enter]%s start %s   %s[c]%s copy   %s[q]%s quit\n", bold, reset, filepath.Base(cfg.Command[0]), bold, reset, bold, reset)
@@ -482,7 +492,7 @@ func listCmd() error {
 func shareCmd(args []string) error {
 	fs := flag.NewFlagSet("shoulder share", flag.ExitOnError)
 	transport := fs.String("t", "unix", "unix, localhost, lan, tailscale, tailcat")
-	readOnly := fs.Bool("read-only", false, "read-only access")
+	readOnly := fs.Bool("read-only", false, "read-only access (not over the unix socket)")
 	fs.Parse(args)
 	cfg, err := findSession(fs.Arg(0))
 	if err != nil {

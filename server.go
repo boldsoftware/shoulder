@@ -100,7 +100,7 @@ func serve(dir string) error {
 	}
 	defer os.Remove(s.ctlSock)
 	os.Chmod(s.ctlSock, 0o600)
-	unixShare, _, err := s.share(context.Background(), "unix", true, false)
+	unixShare, _, err := s.share(context.Background(), "unix", false, false)
 	if err != nil {
 		return err
 	}
@@ -440,8 +440,9 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // HTTP.
 
-// handler serves the agent API under /<token>/ for a share, and, on the
-// session's own socket only, the control API under /ctl/.
+// handler serves a share's agent API: under /<code>/ on a network share,
+// and at the root of the session's own socket, which has no codes and also
+// carries the control API under /ctl/.
 func (s *server) handler(sh *share) http.Handler {
 	mux := http.NewServeMux()
 	if sh.transport == "unix" {
@@ -450,8 +451,18 @@ func (s *server) handler(sh *share) http.Handler {
 		mux.HandleFunc("GET /ctl/info", s.ctlInfo)
 		mux.HandleFunc("POST /ctl/quit", func(w http.ResponseWriter, r *http.Request) { s.quit() })
 		mux.HandleFunc("GET /ctl/attach", s.handleAttach)
+		mux.HandleFunc("/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh, "", false) })
+		return mux
 	}
-	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh) })
+	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		token := r.PathValue("token")
+		readOnly, ok := sh.access(token)
+		if !ok {
+			http.Error(w, "unknown code", http.StatusForbidden)
+			return
+		}
+		s.agent(w, r, sh, token, readOnly)
+	})
 	return mux
 }
 
@@ -496,11 +507,15 @@ func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
 }
 
 // share returns the listener for transport, setting it up if need be, and
-// the code that gives the requested access on it. Asking for read-write
-// access is what gives a share a read-write code. With exclusive, the
-// launcher's menu is switching: other network shares are closed, and
-// asking for read-only access revokes the share's read-write code.
+// the code that gives the requested access on it; the unix socket has no
+// codes, and no read-only access. Asking for read-write access is what
+// gives a network share a read-write code. With exclusive, the launcher's
+// menu is switching: other network shares are closed, and asking for
+// read-only access revokes the share's read-write code.
 func (s *server) share(ctx context.Context, transport string, readOnly, exclusive bool) (*share, string, error) {
+	if transport == "unix" && readOnly {
+		return nil, "", errors.New("the unix socket has no read-only access: anyone who can reach it controls the session")
+	}
 	s.mu.Lock()
 	if exclusive {
 		for name, sh := range s.shares {
@@ -524,6 +539,9 @@ func (s *server) share(ctx context.Context, transport string, readOnly, exclusiv
 			sh, s.shares[transport] = opened, opened
 		}
 		s.mu.Unlock()
+	}
+	if transport == "unix" {
+		return sh, "", nil
 	}
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -600,14 +618,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc.Encode(v)
 }
 
-// agent serves the agent API: /<code>/<endpoint>.
-func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share) {
-	token := r.PathValue("token")
-	readOnly, ok := sh.access(token)
-	if !ok {
-		http.Error(w, "unknown code", http.StatusForbidden)
-		return
-	}
+// agent serves the agent API: /<code>/<endpoint> on a network share, or
+// /<endpoint> on the unix socket, where token is empty.
+func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share, token string, readOnly bool) {
 	switch rest := r.PathValue("rest"); {
 	case rest == "" && r.Method == "GET":
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
