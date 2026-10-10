@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -33,17 +32,15 @@ var transports = []struct {
 	{"tailcat", "t", "tailcat"},
 }
 
-// share is one way into the agent API. Each network share has its own
-// codes: a read-only one from the start, and a read-write one only once
-// read-write access is asked for on it. A share only ever shared read-only
-// has no code that can type, and a code never works on a share it wasn't
-// issued for. The session's own Unix socket has no codes: file permissions
+// share is one way into the agent API. A network share has its own codes,
+// fixed when it opens: a read-only one, and a read-write one unless the
+// session is read-only. A code never works on a share it wasn't issued
+// for. The session's own Unix socket has no codes: file permissions
 // protect it, and whoever can reach it controls the session (the control
 // API is there too), so it has no read-only access either.
 type share struct {
-	mu sync.Mutex
 	ro string // code that can watch; empty on the unix socket, which has none
-	rw string // code that can also type; empty until asked for
+	rw string // code that can also type; empty in a read-only session, and on the unix socket
 
 	transport string
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
@@ -70,8 +67,6 @@ func (sh *share) url(token string) string {
 // long the answer took. A code that isn't set matches nothing, not even an
 // empty string.
 func (sh *share) access(code string) (readOnly, ok bool) {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	switch {
 	case sh.rw != "" && subtle.ConstantTimeCompare([]byte(code), []byte(sh.rw)) == 1:
 		return false, true
@@ -79,14 +74,6 @@ func (sh *share) access(code string) (readOnly, ok bool) {
 		return true, true
 	}
 	return false, false
-}
-
-// readWrite reports whether the share gives read-write access: a network
-// share does once it has a read-write code, the unix socket always.
-func (sh *share) readWrite() bool {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	return sh.transport == "unix" || sh.rw != ""
 }
 
 func (sh *share) close() {
@@ -98,16 +85,16 @@ func (sh *share) close() {
 	}
 }
 
-// openShare sets up a share: its listener, its read-only code, and then,
-// with the code in place, its server. The unix socket is the session's own,
-// served by serve, and gets no code.
+// openShare sets up a share: its listener, its codes, and then, with the
+// codes in place, its server. The unix socket is the session's own, served
+// by serve, and gets no codes.
 func openShare(ctx context.Context, s *server, transport string) (*share, error) {
 	var sh *share
 	var err error
 	switch transport {
 	case "unix":
 		sh = &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder",
-			note: "Anyone who can reach the socket controls the session: file permissions protect it, not codes, and it has no read-only access."}
+			note: "Access to the socket grants full control of the session."}
 	case "localhost":
 		sh, err = listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
 	case "lan":
@@ -130,6 +117,9 @@ func openShare(ctx context.Context, s *server, transport string) (*share, error)
 	}
 	if sh.transport != "unix" {
 		sh.ro = newCode()
+		if !s.cfg.ReadOnly {
+			sh.rw = newCode()
+		}
 		sh.srv = &http.Server{Handler: s.handler(sh)}
 		go sh.srv.Serve(sh.ln)
 	}
@@ -245,7 +235,7 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 		RegionID:          region.RegionID,
 	}
 	return &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}, nil
+		note: "The agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}, nil
 }
 
 func shellQuote(s string) string {
