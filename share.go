@@ -214,18 +214,22 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 	}
 	region := pick.Region[0]
 	priv := key.NewNode()
-	tc := &tailcat.Server{Key: priv, DisablePresharedKey: true, Region: region, Logf: logf}
+	psk := tailcat.NewPresharedKey()
+	tc := &tailcat.Server{Key: priv, PresharedKey: psk, Region: region, Logf: logf}
 	ln, err := tc.Listen(ctx, "tcp", ":80")
 	if err != nil {
 		tc.Close()
 		return nil, fmt.Errorf("tailcat: %w", err)
 	}
-	// The shortest address current clients accept: no pre-shared key (the
-	// access code guards the session; WireGuard still encrypts), and the
-	// relay named by region ID.
+	// The address names the relay by region ID to stay short, and carries
+	// the pre-shared key: it keeps anyone who learns the node key, such as
+	// the relay operator, from joining the tunnel, and keeps a recording of
+	// the traffic confidential against a future quantum computer. The
+	// address is a secret, like the code it comes with.
 	ci := tailcat.ConnInfo{
 		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+		PresharedKey:      psk,
 		RegionID:          region.RegionID,
 	}
 	return &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
