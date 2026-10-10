@@ -15,7 +15,9 @@
 // interfaces, [s] this machine's Tailscale address, or [t] an ephemeral
 // tailcat node, which reaches across networks with nothing but the
 // tailcat binary on the other side. [r] switches between read-write and
-// read-only access; each has its own short code in the URL.
+// read-only access. Each share has its own codes: a read-only one, and a
+// read-write one only once read-write access is asked for on it, so a
+// share only ever shared read-only has no code that can type.
 package main
 
 import (
@@ -258,6 +260,15 @@ func (c *ctl) share(transport string, readOnly, exclusive bool) (shareInfo, erro
 	return info, json.Unmarshal(b, &info)
 }
 
+func (c *ctl) info() (infoReply, error) {
+	var v infoReply
+	b, err := c.do("GET", "/ctl/info")
+	if err != nil {
+		return v, err
+	}
+	return v, json.Unmarshal(b, &v)
+}
+
 // firstScreen shows the paste text and the sharing choices, and returns
 // once the user starts the command (ok) or quits.
 func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
@@ -407,14 +418,8 @@ func sessions() ([]sessionInfo, error) {
 			continue
 		}
 		si := sessionInfo{cfg: cfg}
-		if b, err := newCtl(cfg.path("sock")).do("GET", "/ctl/info"); err == nil {
-			var v struct {
-				Status status   `json:"status"`
-				Shares []string `json:"shares"`
-			}
-			if json.Unmarshal(b, &v) == nil {
-				si.status, si.shares = &v.Status, v.Shares
-			}
+		if v, err := newCtl(cfg.path("sock")).info(); err == nil {
+			si.status, si.shares = &v.Status, v.Shares
 		}
 		out = append(out, si)
 	}

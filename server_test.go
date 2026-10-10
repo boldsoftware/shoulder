@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,17 @@ func (a *agentClient) call(method, endpoint, body string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
+// shareList is the session's shares with their access, as /ctl/info
+// reports them.
+func shareList(t *testing.T, c *ctl) []string {
+	t.Helper()
+	v, err := c.info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.Shares
+}
+
 func (a *agentClient) get(endpoint string) string {
 	a.t.Helper()
 	code, body := a.call("GET", endpoint, "")
@@ -175,8 +187,10 @@ func TestSessionAPI(t *testing.T) {
 		t.Error("bad token accepted")
 	}
 
-	// localhost serves the same session over TCP.
-	lh, err := c.share("localhost", false, false)
+	// localhost serves the same session over TCP, with its own codes: a
+	// share asked for read-only has no read-write code, and the unix
+	// socket's read-write code doesn't work on it.
+	lh, err := c.share("localhost", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,8 +201,41 @@ func TestSessionAPI(t *testing.T) {
 	if s := l.get("capture-pane"); !strings.Contains(s, "after") {
 		t.Errorf("localhost screen:\n%s", s)
 	}
+	if code, _ := l.call("POST", "send-keys", "'echo nope' Enter"); code != http.StatusForbidden {
+		t.Errorf("localhost read-only send: %d", code)
+	}
+	lroot := strings.TrimSuffix(l.base, path.Base(l.base))
+	foreign := &agentClient{t: t, http: l.http, base: lroot + path.Base(a.base)}
+	if code, _ := foreign.call("GET", "status", ""); code != http.StatusForbidden {
+		t.Errorf("unix read-write code on the localhost share: %d", code)
+	}
+	if shares := shareList(t, c); !slices.Contains(shares, "unix:rw") || !slices.Contains(shares, "localhost:ro") {
+		t.Errorf("shares: %v", shares)
+	}
+	// Asking for read-write access gives the share a read-write code;
+	// switching it back to read-only from the launcher revokes it.
+	lrw, err := c.share("localhost", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lw := agentFromPaste(t, cfg, lrw.Paste)
+	if code, out := lw.call("POST", "run?timeout=10", "echo localhost-$((20+2))"); code != 200 || !strings.Contains(out, "localhost-22") {
+		t.Errorf("localhost run: %d\n%s", code, out)
+	}
+	if shares := shareList(t, c); !slices.Contains(shares, "localhost:rw") {
+		t.Errorf("shares: %v", shares)
+	}
+	if _, err := c.share("localhost", true, true); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := lw.call("GET", "status", ""); code != http.StatusForbidden {
+		t.Errorf("revoked localhost read-write code: %d", code)
+	}
+	if s := l.get("capture-pane"); !strings.Contains(s, "localhost-22") {
+		t.Errorf("localhost screen after revoking read-write:\n%s", s)
+	}
 	// Wrong codes on a network share lock it, even against the right code.
-	bad := &agentClient{t: t, http: l.http, base: strings.TrimSuffix(l.base, path.Base(l.base)) + "1-not-it"}
+	bad := &agentClient{t: t, http: l.http, base: lroot + "1-not-it"}
 	for range maxFails {
 		bad.call("GET", "status", "")
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,9 +32,14 @@ var transports = []struct {
 	{"tailcat", "t", "tailcat"},
 }
 
-// share is one way into the agent API.
+// share is one way into the agent API. Each share has its own codes: a
+// read-only one from the start, and a read-write one only once read-write
+// access is asked for on it. A share only ever shared read-only has no code
+// that can type, and a code never works on a share it wasn't issued for.
 type share struct {
 	mu     sync.Mutex
+	ro     string      // code that can watch
+	rw     string      // code that can also type; empty until asked for
 	fails  []time.Time // recent wrong codes
 	locked time.Time   // wrong codes are refused until then
 
@@ -49,6 +55,28 @@ type share struct {
 
 func (sh *share) url(token string) string { return sh.base + "/" + token }
 
+// access says what a code is good for on this share. A wrong code counts
+// against the share's rate limit.
+func (sh *share) access(code string) (readOnly, ok bool) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	switch {
+	case sh.rw != "" && code == sh.rw:
+		return false, true
+	case code == sh.ro:
+		return true, true
+	}
+	sh.failedLocked()
+	return false, false
+}
+
+// readWrite reports whether the share has a read-write code.
+func (sh *share) readWrite() bool {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.rw != ""
+}
+
 // Codes are short enough to guess, so a network share that sees too many
 // wrong ones stops answering for a while: 10 guesses per 10 minutes makes
 // finding one of ~6.5M codes take years. The session's own Unix socket is
@@ -58,12 +86,10 @@ const (
 	failWindow = 10 * time.Minute
 )
 
-func (sh *share) failed() {
+func (sh *share) failedLocked() {
 	if sh.transport == "unix" {
 		return
 	}
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	now := time.Now()
 	recent := sh.fails[:0]
 	for _, t := range sh.fails {
@@ -98,30 +124,44 @@ func (sh *share) close() {
 	}
 }
 
+// openShare sets up a share: its listener, its read-only code, and then,
+// with the code in place, its server.
 func openShare(ctx context.Context, s *server, transport string) (*share, error) {
+	var sh *share
+	var err error
 	switch transport {
 	case "unix":
-		// The session's own socket; always open.
-		return &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder"}, nil
+		// The session's own socket, which serve listens on; always open.
+		sh = &share{transport: "unix", curl: "curl -s --unix-socket " + shellPath(s.ctlSock), base: "http://shoulder"}
 	case "localhost":
-		return listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
+		sh, err = listenShare(s, transport, "127.0.0.1", "127.0.0.1", "")
 	case "lan":
 		host := lanAddress()
-		return listenShare(s, transport, "", host,
+		sh, err = listenShare(s, transport, "", host,
 			"Listening on every interface over plain HTTP: anyone who can reach this machine and has the URL can use the session.")
 	case "tailscale":
-		ip, name, err := tailscaleAddress(ctx)
-		if err != nil {
+		var ip, name string
+		if ip, name, err = tailscaleAddress(ctx); err != nil {
 			return nil, err
 		}
-		return listenShare(s, transport, ip, cmpOr(name, ip), "")
+		sh, err = listenShare(s, transport, ip, cmp.Or(name, ip), "")
 	case "tailcat":
-		return tailcatShare(ctx, s)
+		sh, err = tailcatShare(ctx, s)
+	default:
+		return nil, fmt.Errorf("unknown transport %q", transport)
 	}
-	return nil, fmt.Errorf("unknown transport %q", transport)
+	if err != nil {
+		return nil, err
+	}
+	sh.ro = newCode()
+	if sh.ln != nil {
+		sh.srv = &http.Server{Handler: s.handler(sh)}
+		go sh.srv.Serve(sh.ln)
+	}
+	return sh, nil
 }
 
-// listenShare serves the agent API on bind:port, reachable as host:port.
+// listenShare listens for the agent API on bind:port, reachable as host:port.
 func listenShare(s *server, transport, bind, host, warning string) (*share, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(bind, strconv.Itoa(s.cfg.Port)))
 	if err != nil && s.cfg.Port != 0 {
@@ -131,10 +171,7 @@ func listenShare(s *server, transport, bind, host, warning string) (*share, erro
 		return nil, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	sh := &share{transport: transport, curl: "curl -s", base: "http://" + net.JoinHostPort(host, strconv.Itoa(port)), warning: warning, ln: ln}
-	sh.srv = &http.Server{Handler: s.handler(sh)}
-	go sh.srv.Serve(ln)
-	return sh, nil
+	return &share{transport: transport, curl: "curl -s", base: "http://" + net.JoinHostPort(host, strconv.Itoa(port)), warning: warning, ln: ln}, nil
 }
 
 // lanAddress is this machine's address on its primary network.
@@ -228,11 +265,8 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
 		RegionID:          region.RegionID,
 	}
-	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
-	sh.srv = &http.Server{Handler: s.handler(sh)}
-	go sh.srv.Serve(ln)
-	return sh, nil
+	return &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
+		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}, nil
 }
 
 func shellQuote(s string) string {
@@ -251,11 +285,4 @@ func shellPath(path string) string {
 		return t
 	}
 	return shellQuote(path)
-}
-
-func cmpOr(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
