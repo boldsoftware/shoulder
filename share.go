@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,11 +38,9 @@ var transports = []struct {
 // access is asked for on it. A share only ever shared read-only has no code
 // that can type, and a code never works on a share it wasn't issued for.
 type share struct {
-	mu     sync.Mutex
-	ro     string      // code that can watch
-	rw     string      // code that can also type; empty until asked for
-	fails  []time.Time // recent wrong codes
-	locked time.Time   // wrong codes are refused until then
+	mu sync.Mutex
+	ro string // code that can watch
+	rw string // code that can also type; empty until asked for
 
 	transport string
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
@@ -55,18 +54,20 @@ type share struct {
 
 func (sh *share) url(token string) string { return sh.base + "/" + token }
 
-// access says what a code is good for on this share. A wrong code counts
-// against the share's rate limit.
+// access says what a code is good for on this share. Codes are long enough
+// that guessing is hopeless at any rate, so there is no rate limit; the
+// comparison takes constant time, so a wrong code learns nothing from how
+// long the answer took. A code that isn't set matches nothing, not even an
+// empty string.
 func (sh *share) access(code string) (readOnly, ok bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	switch {
-	case sh.rw != "" && code == sh.rw:
+	case sh.rw != "" && subtle.ConstantTimeCompare([]byte(code), []byte(sh.rw)) == 1:
 		return false, true
-	case code == sh.ro:
+	case sh.ro != "" && subtle.ConstantTimeCompare([]byte(code), []byte(sh.ro)) == 1:
 		return true, true
 	}
-	sh.failedLocked()
 	return false, false
 }
 
@@ -75,44 +76,6 @@ func (sh *share) readWrite() bool {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	return sh.rw != ""
-}
-
-// Codes are short enough to guess, so a network share that sees too many
-// wrong ones stops answering for a while: 10 guesses per 10 minutes makes
-// finding one of ~6.5M codes take years. The session's own Unix socket is
-// protected by file permissions instead.
-const (
-	maxFails   = 10
-	failWindow = 10 * time.Minute
-)
-
-func (sh *share) failedLocked() {
-	if sh.transport == "unix" {
-		return
-	}
-	now := time.Now()
-	recent := sh.fails[:0]
-	for _, t := range sh.fails {
-		if now.Sub(t) < failWindow {
-			recent = append(recent, t)
-		}
-	}
-	sh.fails = append(recent, now)
-	if len(sh.fails) >= maxFails {
-		sh.locked = now.Add(failWindow)
-		sh.fails = nil
-		log.Printf("%s share: %d wrong codes; locked until %s", sh.transport, maxFails, sh.locked.Format(time.TimeOnly))
-	}
-}
-
-// lockedUntil is when a lock ends, or zero if the share isn't locked.
-func (sh *share) lockedUntil() time.Time {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if time.Now().Before(sh.locked) {
-		return sh.locked
-	}
-	return time.Time{}
 }
 
 func (sh *share) close() {

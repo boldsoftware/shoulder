@@ -234,16 +234,13 @@ func TestSessionAPI(t *testing.T) {
 	if s := l.get("capture-pane"); !strings.Contains(s, "localhost-22") {
 		t.Errorf("localhost screen after revoking read-write:\n%s", s)
 	}
-	// Wrong codes on a network share lock it, even against the right code.
-	bad := &agentClient{t: t, http: l.http, base: lroot + "1-not-it"}
-	for range maxFails {
-		bad.call("GET", "status", "")
+	// A wrong code is refused, and the right one keeps working.
+	bad := &agentClient{t: t, http: l.http, base: lroot + "NOTACODE"}
+	if code, _ := bad.call("GET", "status", ""); code != http.StatusForbidden {
+		t.Errorf("wrong code: %d", code)
 	}
-	if code, _ := l.call("GET", "status", ""); code != http.StatusTooManyRequests {
-		t.Errorf("after %d wrong codes, the right one got %d; want 429", maxFails, code)
-	}
-	if s := a.get("capture-pane"); !strings.Contains(s, "after") {
-		t.Errorf("localhost screen:\n%s", s)
+	if code, _ := l.call("GET", "status", ""); code != 200 {
+		t.Errorf("right code after a wrong one: %d", code)
 	}
 
 	// A terminal attaching gets the screen repainted.

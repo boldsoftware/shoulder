@@ -602,10 +602,6 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // agent serves the agent API: /<code>/<endpoint>.
 func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share) {
-	if until := sh.lockedUntil(); !until.IsZero() {
-		http.Error(w, "too many wrong codes; this share is locked until "+until.Format("15:04:05"), http.StatusTooManyRequests)
-		return
-	}
 	token := r.PathValue("token")
 	readOnly, ok := sh.access(token)
 	if !ok {
