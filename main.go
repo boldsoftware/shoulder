@@ -43,6 +43,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
@@ -452,7 +453,10 @@ func listCmd() error {
 	if err != nil {
 		return err
 	}
-	for _, si := range all {
+	// Columns are as wide as their widest entry, three spaces apart.
+	states := make([]string, len(all))
+	nameW, stateW := 0, 0
+	for i, si := range all {
 		state := "ended"
 		if st := si.status; st != nil {
 			switch {
@@ -465,7 +469,12 @@ func listCmd() error {
 			}
 			state += " · " + strings.Join(si.shares, ",")
 		}
-		fmt.Printf("%-18s %-34s %s  (%s)\n", si.cfg.Name, state, displayCommand(si.cfg.Command), tildePath(si.cfg.Cwd))
+		states[i] = state
+		nameW = max(nameW, utf8.RuneCountInString(si.cfg.Name))
+		stateW = max(stateW, utf8.RuneCountInString(state))
+	}
+	for i, si := range all {
+		fmt.Printf("%-*s   %-*s   %s   (%s)\n", nameW, si.cfg.Name, stateW, states[i], displayCommand(si.cfg.Command), tildePath(si.cfg.Cwd))
 	}
 	return nil
 }
