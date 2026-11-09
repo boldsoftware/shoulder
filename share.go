@@ -41,7 +41,6 @@ type share struct {
 	curl      string // command prefix that reaches base, e.g. "curl -s --unix-socket /x"
 	base      string // URL the paths hang off, e.g. "http://127.0.0.1:7357"
 	warning   string // a risk the user should know about
-	note      string // how the agent's side works
 	ln        net.Listener
 	srv       *http.Server
 	tc        *tailcat.Server // when tailcat carries the share
@@ -198,7 +197,7 @@ func tailscaleAddress(ctx context.Context) (ip, name string, err error) {
 // tailcatShare puts the API on an ephemeral tailcat node, run in this
 // process: an encrypted WireGuard tunnel that reaches across NATs, with no
 // account and nothing listening on this machine's network. Agents reach
-// it with the stock tailcat client: `tailcat socks curl`.
+// it with the stock tailcat client, via `go run ... socks curl`.
 func tailcatShare(ctx context.Context, s *server) (*share, error) {
 	logf := logger.Discard
 	if f, err := os.OpenFile(s.cfg.path("tailcat.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
@@ -228,8 +227,8 @@ func tailcatShare(ctx context.Context, s *server) (*share, error) {
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
 		RegionID:          region.RegionID,
 	}
-	sh := &share{transport: "tailcat", curl: "tailcat socks curl -s", base: "http://" + string(ci.Addr()), ln: ln, tc: tc,
-		note: "Nothing to install here; the agent needs tailcat: go install github.com/tailscale/tailcat/cmd/tailcat@latest"}
+	sh := &share{transport: "tailcat", curl: "go run github.com/tailscale/tailcat/cmd/tailcat@latest socks curl -s",
+		base: "http://" + string(ci.Addr()), ln: ln, tc: tc}
 	sh.srv = &http.Server{Handler: s.handler(sh)}
 	go sh.srv.Serve(ln)
 	return sh, nil
