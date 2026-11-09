@@ -277,7 +277,6 @@ func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
 		}
 		switch k {
 		case '\r', '\n':
-			fmt.Print("\x1b[H\x1b[2J")
 			return info, true, nil
 		case 'q', 3, 4: // q, C-c, C-d
 			fmt.Print("\x1b[H\x1b[2J")
