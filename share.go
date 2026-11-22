@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -250,6 +251,16 @@ func shellPath(path string) string {
 		return t
 	}
 	return shellQuote(path)
+}
+
+// unixHint says how to reach the session's socket from another machine:
+// ssh (OpenSSH 6.7 or later) forwards Unix sockets too. The paths are
+// absolute because ssh doesn't expand ~ in them. The remote path is new
+// each time, because sshd won't bind over a socket file a previous
+// forward left behind.
+func unixHint(cfg *config, sock string) string {
+	there := fmt.Sprintf("/tmp/shoulder-%s-%06x.sock", cfg.Name, rand.IntN(1<<24))
+	return "Forward the socket to a remote machine: ssh -N -R " + shellQuote(there+":"+sock) + " REMOTE (then --unix-socket " + there + " there)"
 }
 
 func cmpOr(a, b string) string {

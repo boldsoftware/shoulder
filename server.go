@@ -58,6 +58,16 @@ type server struct {
 	clients    map[*client]bool
 	owner      *client
 	shares     map[string]*share
+
+	// A browser session's browser (browser.go), once a tab is shared; the
+	// connection before that, while the person picks; what agents did.
+	browser     browser
+	pending     sharer
+	pendingKind string
+	connecting  sync.Mutex
+	activity    []activity
+	browserDone bool
+	browserTabs int // how many tabs are shared, as of the last look
 }
 
 const maxOutput = 8 << 20
@@ -72,9 +82,20 @@ type config struct {
 	Port     int           `json:"port"`
 	Host     string        `json:"host"` // this machine's name, for agents' context
 	Attached bool          `json:"-"`
+
+	// A browser session shares a browser ("chrome", "safari") instead of
+	// running Command.
+	Browser string `json:"browser,omitempty"`
+	Profile string `json:"profile,omitempty"` // Chrome's profile, by name: "Work"
+	AllTabs bool   `json:"all_tabs,omitempty"`
 }
 
 func (c *config) path(name string) string { return filepath.Join(c.Dir, name) }
+
+func (c *config) save() error {
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return os.WriteFile(c.path("config.json"), b, 0o600)
+}
 
 // serve is the session server's main: `shoulder __serve <dir>`.
 func serve(dir string) error {
@@ -112,6 +133,7 @@ func serve(dir string) error {
 	srv := &http.Server{Handler: s.handler(unixShare)}
 	go srv.Serve(ln)
 
+	defer s.closePending()
 	// A session nobody starts goes away on its own.
 	select {
 	case <-s.started:
@@ -119,6 +141,9 @@ func serve(dir string) error {
 		return nil
 	case <-time.After(time.Hour):
 		return nil
+	}
+	if s.browser != nil {
+		return s.serveBrowser()
 	}
 	go s.watchForeground()
 	err = s.cmd.Wait()
@@ -455,6 +480,9 @@ func (s *server) handler(sh *share) http.Handler {
 		mux.HandleFunc("GET /ctl/info", s.ctlInfo)
 		mux.HandleFunc("POST /ctl/quit", func(w http.ResponseWriter, r *http.Request) { s.quit() })
 		mux.HandleFunc("GET /ctl/attach", s.handleAttach)
+		mux.HandleFunc("POST /ctl/kind", s.ctlKind)
+		mux.HandleFunc("POST /ctl/browser", s.ctlBrowser)
+		mux.HandleFunc("GET /ctl/activity", s.ctlActivity)
 	}
 	mux.HandleFunc("/{token}/{rest...}", func(w http.ResponseWriter, r *http.Request) { s.agent(w, r, sh) })
 	return mux
@@ -477,6 +505,7 @@ type shareInfo struct {
 	ReadOnly  bool   `json:"read_only"`
 	Paste     string `json:"paste"`
 	Warning   string `json:"warning,omitempty"`
+	Hint      string `json:"hint,omitempty"`
 }
 
 func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +522,11 @@ func (s *server) ctlShare(w http.ResponseWriter, r *http.Request) {
 	if readOnly {
 		token = s.roToken
 	}
-	writeJSON(w, shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, token, readOnly), Warning: sh.warning})
+	info := shareInfo{Transport: transport, ReadOnly: readOnly, Paste: paste(s.cfg, sh, token, readOnly), Warning: sh.warning}
+	if transport == "unix" {
+		info.Hint = unixHint(s.cfg, s.ctlSock)
+	}
+	writeJSON(w, info)
 }
 
 // share returns the listener for transport, setting it up if need be.
@@ -555,6 +588,8 @@ type status struct {
 	IdleFor    string   `json:"no_output_for,omitempty"`
 	Offset     int64    `json:"output_offset"`
 	ReadOnly   bool     `json:"read_only"`
+	Browser    string   `json:"browser,omitempty"` // a browser session's browser
+	SharedTabs int      `json:"shared_tabs,omitempty"`
 }
 
 func (s *server) status() status {
@@ -565,6 +600,14 @@ func (s *server) status() status {
 		Started: s.cmd != nil, Running: s.cmd != nil && !s.exited,
 		Foreground: s.fg, AtPrompt: s.fgIsShell, Terminals: len(s.clients),
 		Offset: s.base + int64(len(s.out)),
+	}
+	if s.cfg.Browser != "" {
+		st.Browser = browserLabels[s.cfg.Browser]
+		if s.browser != nil {
+			st.Browser = s.browser.label()
+			st.Started, st.Running = true, !s.browserDone
+			st.SharedTabs = s.browserTabs
+		}
 	}
 	if s.exited {
 		code := s.exitCode
@@ -603,6 +646,13 @@ func (s *server) agent(w http.ResponseWriter, r *http.Request, sh *share) {
 		return
 	}
 	token := r.PathValue("token")
+	s.mu.Lock()
+	isBrowser := s.cfg.Browser != ""
+	s.mu.Unlock()
+	if isBrowser {
+		s.browserAgent(w, r, sh, token, readOnly)
+		return
+	}
 	switch rest := r.PathValue("rest"); {
 	case rest == "" && r.Method == "GET":
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")

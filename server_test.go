@@ -345,3 +345,25 @@ func TestQueriesAnsweredWhileDetached(t *testing.T) {
 		t.Errorf("query unanswered: %d\n%s", code, out)
 	}
 }
+
+// The unix share says how to forward its socket over ssh.
+func TestUnixHint(t *testing.T) {
+	cfg, c := testSession(t)
+	info, err := c.share("unix", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`ssh -N -R (/tmp/shoulder-` + cfg.Name + `-[0-9a-f]{6}\.sock):` + regexp.QuoteMeta(cfg.path("sock")) + ` REMOTE \(then --unix-socket (\S+) there\)`)
+	m := re.FindStringSubmatch(info.Hint)
+	if m == nil || m[1] != m[2] {
+		t.Fatalf("hint: %s", info.Hint)
+	}
+	// Each time, a new remote path.
+	again, _ := c.share("unix", false, false)
+	if again.Hint == info.Hint {
+		t.Errorf("same hint twice: %s", again.Hint)
+	}
+	if info, _ := c.share("localhost", false, false); info.Hint != "" {
+		t.Errorf("localhost hint: %s", info.Hint)
+	}
+}

@@ -5,12 +5,18 @@
 // agents read the screen, wait for output, and type, over plain curl.
 //
 //	shoulder [flags] [--] [command [args...]]   # default $SHELL
+//	shoulder browser [flags] [chrome|safari]
 //	shoulder attach [name]
 //	shoulder share [-t transport] [-read-only] [name]
 //	shoulder ls
 //
+// A session can share browser tabs instead: your own Chrome, over the
+// DevTools protocol (see chrome.go), or Safari, over AppleScript. Agents
+// read pages, take screenshots, click and type over the same kind of API.
+//
 // Before the command starts, a first screen shows the text to paste to an
-// agent and lets you choose how the agent connects: [u] the session's Unix
+// agent and lets you choose what to share ([1] the terminal, [2] Chrome,
+// [3] Safari) and how the agent connects: [u] the session's Unix
 // socket (default; for agents on this machine), [h] localhost TCP, [*] all
 // interfaces, [s] this machine's Tailscale address, or [t] an ephemeral
 // tailcat node, which reaches across networks with nothing but the
@@ -58,6 +64,8 @@ func main() {
 	switch cmd {
 	case "__serve":
 		err = serve(args[1])
+	case "browser":
+		err = run(args[1:], true)
 	case "attach":
 		err = attachCmd(args[1:])
 	case "share":
@@ -67,7 +75,7 @@ func main() {
 	case "version", "-version", "--version":
 		fmt.Println("shoulder", version)
 	default:
-		err = run(args)
+		err = run(args, false)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "shoulder:", err)
@@ -83,10 +91,11 @@ func sessionsDir() (string, error) {
 	return filepath.Join(cache, "shoulder"), nil
 }
 
-func run(args []string) error {
+func run(args []string, browserCmd bool) error {
 	fs := flag.NewFlagSet("shoulder", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: shoulder [flags] [--] [command [args...]]   run command (default $SHELL) in a shareable session
+       shoulder browser [flags] [chrome|safari]         share browser tabs instead (default chrome)
        shoulder attach [name]                           reattach a terminal to a running session
        shoulder share [-t transport] [-read-only] [name] print the text to paste to an agent
        shoulder ls                                      list sessions
@@ -94,6 +103,32 @@ func run(args []string) error {
 flags:
 `)
 		fs.PrintDefaults()
+	}
+	ch := choice{tabs: "active"}
+	var tabs *string
+	var profile *string
+	var standalone *bool
+	if browserCmd {
+		fs = flag.NewFlagSet("shoulder browser", flag.ExitOnError)
+		fs.Usage = func() {
+			fmt.Fprint(fs.Output(), `usage: shoulder browser [flags] [chrome|safari]
+
+Shares browser tabs with an agent, as shoulder shares a terminal. Chrome
+is your own, running Chrome: allow remote debugging once at
+chrome://inspect/#remote-debugging, and click Allow when Chrome asks.
+Or -standalone: shoulder starts a Chrome of its own, which needs neither.
+
+flags:
+`)
+			fs.PrintDefaults()
+		}
+		ch.kind = "chrome"
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			ch.kind, args = args[0], args[1:]
+		}
+		tabs = fs.String("tabs", "current", "which tabs to share: current (the tab you're on), new (a new tab), all (every tab of the profile, and new ones)")
+		standalone = fs.Bool("standalone", false, "Chrome: start a standalone Chrome (its own profile, kept for next time) instead of sharing yours; no remote debugging to allow")
+		profile = fs.String("profile", "", "Chrome: the profile to share, by name as Chrome shows it (\"Work\") or dir (\"Profile 1\") (default: the one you used last)")
 	}
 	transport := fs.String("t", "unix", "how agents connect: unix, localhost, lan (all interfaces), tailscale, tailcat")
 	readOnly := fs.Bool("read-only", false, "share read-only access (agents can watch but not type)")
@@ -103,13 +138,50 @@ flags:
 	linger := fs.Duration("linger", 10*time.Minute, "keep serving the final screen this long after the command exits")
 	nested := fs.Bool("nested", false, "allow starting a session inside another shoulder session")
 	fs.Parse(args)
+	if browserCmd {
+		if fs.NArg() > 0 {
+			ch.kind = fs.Arg(0)
+		}
+		if browserLabels[ch.kind] == "" || fs.NArg() > 1 {
+			return fmt.Errorf("shoulder browser shares chrome or safari, not %q", strings.Join(fs.Args(), " "))
+		}
+		ch.tabs = map[string]string{"current": "active", "active": "active", "new": "new", "all": "all"}[*tabs]
+		if ch.tabs == "" {
+			return fmt.Errorf("-tabs is current, new or all, not %q", *tabs)
+		}
+		if *standalone {
+			if ch.kind != "chrome" {
+				return errors.New("-standalone is for Chrome")
+			}
+			if *profile != "" {
+				return errors.New("-profile is for your Chrome, not a standalone one")
+			}
+			ch.standalone = true
+		}
+		if *profile != "" {
+			if ch.kind != "chrome" {
+				return errors.New("-profile is for Chrome")
+			}
+			profiles := readChromeProfiles(defaultChromeDir())
+			pr, ok := profiles.find(*profile)
+			if !ok {
+				var names []string
+				for _, dir := range profiles.order {
+					names = append(names, strconv.Quote(profiles.all[dir].Name))
+				}
+				return fmt.Errorf("Chrome has no profile %q (it has %s)", *profile, cmpOr(strings.Join(names, ", "), "none that shoulder can see"))
+			}
+			ch.profile = pr.Dir
+		}
+	}
 
-	if outer := os.Getenv("SHOULDER"); outer != "" && !*nested {
+	if outer := os.Getenv("SHOULDER"); outer != "" && !*nested && !browserCmd {
 		return fmt.Errorf("already inside shoulder session %s; `shoulder share %s` prints its line for an agent (-nested starts one anyway)", outer, outer)
 	}
 
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return errors.New("shoulder needs a terminal")
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	if !interactive && !(browserCmd && *yes) {
+		return errors.New("shoulder needs a terminal (shoulder browser -y doesn't)")
 	}
 	if !validTransport(*transport) {
 		return fmt.Errorf("unknown transport %q", *transport)
@@ -118,7 +190,10 @@ flags:
 	if err != nil {
 		return err
 	}
-	cfg := &config{Command: fs.Args(), Linger: *linger, Port: *port, Started: time.Now()}
+	cfg := &config{Command: fs.Args(), Linger: *linger, Port: *port, Started: time.Now(), Browser: ch.kind}
+	if browserCmd {
+		cfg.Command = nil
+	}
 	if len(cfg.Command) == 0 {
 		cfg.Command = []string{cmp.Or(os.Getenv("SHELL"), "/bin/sh")}
 	}
@@ -148,11 +223,29 @@ flags:
 	}
 	if *yes {
 		fmt.Printf("%s\n", info.Paste)
-	} else {
-		var ok bool
-		if info, ok, err = firstScreen(cfg, ctl, info); err != nil || !ok {
+	}
+	for note := ""; ; {
+		if !*yes {
+			var ok bool
+			if info, ok, err = firstScreen(cfg, ctl, info, &ch, note); err != nil || !ok {
+				ctl.post("/ctl/quit")
+				return err
+			}
+		}
+		if ch.kind == "" {
+			break
+		}
+		ok, err := connectBrowser(cfg, ctl, ch, !*yes)
+		if ok {
+			return browserScreen(cfg, ctl, info.Paste)
+		}
+		if *yes || err != nil && !interactive {
 			ctl.post("/ctl/quit")
 			return err
+		}
+		note = ""
+		if err != nil {
+			note = fmt.Sprintf("%s⚠ %s%s", "\x1b[33m", err, reset)
 		}
 	}
 	cols, rows := termSize()
@@ -224,7 +317,11 @@ func newCtl(sock string) *ctl {
 }
 
 func (c *ctl) do(method, path string) ([]byte, error) {
-	req, err := http.NewRequest(method, "http://shoulder"+path, nil)
+	return c.doContext(context.Background(), method, path)
+}
+
+func (c *ctl) doContext(ctx context.Context, method, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, "http://shoulder"+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -259,24 +356,45 @@ func (c *ctl) share(transport string, readOnly, exclusive bool) (shareInfo, erro
 }
 
 // firstScreen shows the paste text and the sharing choices, and returns
-// once the user starts the command (ok) or quits.
-func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
+// once the user starts the command or shares the browser (ok) or quits.
+func firstScreen(cfg *config, c *ctl, info shareInfo, ch *choice, note string) (shareInfo, bool, error) {
 	old, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return info, false, err
 	}
 	defer term.Restore(int(os.Stdin.Fd()), old)
-	in := bufio.NewReader(os.Stdin)
-	note := ""
+	var scr screen
+	var keys []byte
 	for {
-		drawFirstScreen(cfg, info, note)
+		status := ""
+		ready := true
+		if ch.kind != "" {
+			ready, status = browserReady(*ch)
+		}
+		if ready && strings.HasPrefix(note, notYet) {
+			note = ""
+		}
+		if len(keys) == 0 {
+			scr.draw(drawFirstScreen(cfg, info, *ch, ready, status, note))
+			// The browser's state can change while this is up: check again.
+			if keys, err = readKeys(time.Second); err != nil {
+				return info, false, err
+			}
+			continue
+		}
+		k := keys[0]
+		keys = keys[1:]
 		note = ""
-		k, err := in.ReadByte()
-		if err != nil {
-			return info, false, err
+		if handled, n := browserKey(c, cfg, ch, k); handled {
+			note = n
+			continue
 		}
 		switch k {
 		case '\r', '\n':
+			if !ready {
+				note = notYet + browserLabels[ch.kind] + " isn't reachable (see above)."
+				continue
+			}
 			return info, true, nil
 		case 'q', 3, 4: // q, C-c, C-d
 			fmt.Print("\x1b[H\x1b[2J")
@@ -297,7 +415,7 @@ func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
 		default:
 			for _, tr := range transports {
 				if string(k) == tr.key && tr.name != info.Transport {
-					drawFirstScreen(cfg, info, "setting up "+tr.label+"…")
+					scr.draw(drawFirstScreen(cfg, info, *ch, ready, status, "setting up "+tr.label+"…"))
 					next, err := c.share(tr.name, info.ReadOnly, true)
 					if err != nil {
 						note = err.Error()
@@ -310,23 +428,40 @@ func firstScreen(cfg *config, c *ctl, info shareInfo) (shareInfo, bool, error) {
 	}
 }
 
+const notYet = "Not yet: "
+
 const (
 	bold  = "\x1b[1m"
 	rev   = "\x1b[7m"
+	dim   = "\x1b[2m"
 	reset = "\x1b[0m"
 )
 
-func drawFirstScreen(cfg *config, info shareInfo, note string) {
+func drawFirstScreen(cfg *config, info shareInfo, ch choice, ready bool, status, note string) string {
 	var b strings.Builder
-	p := func(format string, args ...any) {
-		b.WriteString(strings.ReplaceAll(fmt.Sprintf(format, args...), "\n", "\r\n"))
+	p := func(format string, args ...any) { fmt.Fprintf(&b, format, args...) }
+	what := displayCommand(cfg.Command)
+	if ch.kind != "" {
+		what = browserLabels[ch.kind]
 	}
-	p("\x1b[H\x1b[2J%sshoulder%s · session %s%s%s · %s\n\n", bold, reset, bold, cfg.Name, reset, displayCommand(cfg.Command))
+	p("%sshoulder%s · session %s%s%s · %s\n\n", bold, reset, bold, cfg.Name, reset, what)
 	p("Paste this to an agent (Claude Code, Codex, or one on another machine):\n\n%s%s%s\n\n", bold, info.Paste, reset)
 	if info.Warning != "" {
 		p("%s⚠ %s%s\n", "\x1b[33m", info.Warning, reset)
 	}
+	if info.Hint != "" {
+		p("%s%s%s\n", dim, info.Hint, reset)
+	}
 	p("\n%sshare%s  ", bold, reset)
+	for _, kd := range availableKinds() {
+		label := "[" + kd.key + "] " + kd.label
+		if kd.name == ch.kind {
+			label = rev + label + reset
+		}
+		p("%s  ", label)
+	}
+	browserRows(p, ch)
+	p("\n%svia%s    ", bold, reset)
 	for _, tr := range transports {
 		label := "[" + tr.key + "] " + tr.label
 		if tr.name == info.Transport {
@@ -346,11 +481,20 @@ func drawFirstScreen(cfg *config, info shareInfo, note string) {
 		p("%s  ", label)
 	}
 	p("\n")
-	p("\n%s[enter]%s start %s   %s[c]%s copy   %s[q]%s quit\n", bold, reset, filepath.Base(cfg.Command[0]), bold, reset, bold, reset)
+	start := "start " + filepath.Base(cfg.Command[0])
+	if ch.kind != "" {
+		mark := "\x1b[32m✓\x1b[0m"
+		if !ready {
+			mark = "\x1b[33m⚠\x1b[0m"
+		}
+		p("\n%s %s\n", mark, status)
+		start = "share " + browserLabels[ch.kind]
+	}
+	p("\n%s[enter]%s %s   %s[c]%s copy   %s[q]%s quit\n", bold, reset, start, bold, reset, bold, reset)
 	if note != "" {
 		p("\n%s\n", note)
 	}
-	os.Stdout.WriteString(b.String())
+	return b.String()
 }
 
 func copyToClipboard(s string) error {
@@ -445,10 +589,23 @@ func listCmd() error {
 	}
 	for _, si := range all {
 		state := "ended"
+		what := displayCommand(si.cfg.Command)
+		if si.cfg.Browser != "" {
+			what = browserLabels[si.cfg.Browser]
+		}
 		if st := si.status; st != nil {
 			switch {
 			case !st.Started:
 				state = "not started"
+			case st.Browser != "":
+				what = st.Browser
+				state = fmt.Sprintf("sharing %d tab", st.SharedTabs)
+				if st.SharedTabs != 1 {
+					state += "s"
+				}
+				if !st.Running {
+					state = "ended"
+				}
 			case st.ExitCode != nil:
 				state = fmt.Sprintf("exited %d", *st.ExitCode)
 			default:
@@ -456,7 +613,7 @@ func listCmd() error {
 			}
 			state += " · " + strings.Join(si.shares, ",")
 		}
-		fmt.Printf("%-18s %-34s %s  (%s)\n", si.cfg.Name, state, displayCommand(si.cfg.Command), tildePath(si.cfg.Cwd))
+		fmt.Printf("%-18s %-34s %s  (%s)\n", si.cfg.Name, state, what, tildePath(si.cfg.Cwd))
 	}
 	return nil
 }
@@ -477,6 +634,9 @@ func shareCmd(args []string) error {
 	if info.Warning != "" {
 		fmt.Fprintln(os.Stderr, "⚠", info.Warning)
 	}
+	if info.Hint != "" {
+		fmt.Fprintln(os.Stderr, info.Hint)
+	}
 	fmt.Print(info.Paste)
 	return nil
 }
@@ -487,6 +647,9 @@ func attachCmd(args []string) error {
 	cfg, err := findSession(fs.Arg(0))
 	if err != nil {
 		return err
+	}
+	if cfg.Browser != "" {
+		return browserScreen(cfg, newCtl(cfg.path("sock")), "")
 	}
 	return attach(cfg, true)
 }

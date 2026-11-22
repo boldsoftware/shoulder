@@ -5,6 +5,8 @@ go 1.27.1
 require (
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/charmbracelet/x/vt v0.0.0-20261004011457-ad85c59fdf4e
+	github.com/chromedp/cdproto v0.160.1
+	github.com/chromedp/chromedp v0.24.0
 	github.com/creack/pty v1.1.24
 	github.com/tailscale/tailcat v0.7.0
 	golang.org/x/sys v0.48.0
