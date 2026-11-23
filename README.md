@@ -47,7 +47,7 @@ The agent gets the tab you're on, plus the tabs and popups it opens
 itself; it can close only the tabs it opened. Paste the first screen's
 text to the agent and it finds out the rest (`GET <url>/` is the guide).
 While sharing, your terminal shows the shared tabs and what the agent does;
-`[d]` detaches (`shoulder attach` comes back), `[q]` stops sharing.
+`[q]` stops sharing.
 
 **Chrome** (version 144 or later) is shared over the DevTools protocol.
 Once, open `chrome://inspect/#remote-debugging` and turn on "Allow remote

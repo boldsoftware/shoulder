@@ -1,12 +1,10 @@
 // Command shoulder runs a command in a terminal session you can hand
-// to an agent. It is dtach with an HTTP API: the command
-// runs in a PTY owned by a background session server, your terminal
-// attaches to it (`shoulder attach` reattaches if it goes away), and
-// agents read the screen, wait for output, and type, over plain curl.
+// to an agent. The command runs in a PTY that shoulder owns, your terminal
+// shows it, and agents read the screen, wait for output, and type, over
+// plain curl. The session ends when the command does.
 //
 //	shoulder [flags] [--] [command [args...]]   # default $SHELL
 //	shoulder browser [flags] [chrome|safari]
-//	shoulder attach [name]
 //	shoulder share [-t transport] [-read-only] [name]
 //	shoulder ls
 //
@@ -34,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -62,12 +61,8 @@ func main() {
 		cmd = args[0]
 	}
 	switch cmd {
-	case "__serve":
-		err = serve(args[1])
 	case "browser":
 		err = run(args[1:], true)
-	case "attach":
-		err = attachCmd(args[1:])
 	case "share":
 		err = shareCmd(args[1:])
 	case "ls":
@@ -96,7 +91,6 @@ func run(args []string, browserCmd bool) error {
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: shoulder [flags] [--] [command [args...]]   run command (default $SHELL) in a shareable session
        shoulder browser [flags] [chrome|safari]         share browser tabs instead (default chrome)
-       shoulder attach [name]                           reattach a terminal to a running session
        shoulder share [-t transport] [-read-only] [name] print the text to paste to an agent
        shoulder ls                                      list sessions
 
@@ -135,7 +129,6 @@ flags:
 	yes := fs.Bool("y", false, "skip the first screen: share, print the paste text, and start")
 	port := fs.Int("port", 0, "TCP port for localhost/lan/tailscale/tailcat shares (default: any free port)")
 	name := fs.String("name", "", "session name (default: two random words)")
-	linger := fs.Duration("linger", 10*time.Minute, "keep serving the final screen this long after the command exits")
 	nested := fs.Bool("nested", false, "allow starting a session inside another shoulder session")
 	fs.Parse(args)
 	if browserCmd {
@@ -190,7 +183,7 @@ flags:
 	if err != nil {
 		return err
 	}
-	cfg := &config{Command: fs.Args(), Linger: *linger, Port: *port, Started: time.Now(), Browser: ch.kind}
+	cfg := &config{Command: fs.Args(), Port: *port, Started: time.Now(), Browser: ch.kind}
 	if browserCmd {
 		cfg.Command = nil
 	}
@@ -207,18 +200,18 @@ flags:
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(cfg, "", "  ")
-	if err := os.WriteFile(cfg.path("config.json"), b, 0o600); err != nil {
+	if err := cfg.save(); err != nil {
 		return err
 	}
-	if err := spawnServer(cfg); err != nil {
+	stop, err := startServer(cfg)
+	if err != nil {
 		return err
 	}
+	defer stop()
 	ctl := newCtl(cfg.path("sock"))
 
 	info, err := ctl.share(*transport, *readOnly, true)
 	if err != nil {
-		ctl.post("/ctl/quit")
 		return err
 	}
 	if *yes {
@@ -228,7 +221,6 @@ flags:
 		if !*yes {
 			var ok bool
 			if info, ok, err = firstScreen(cfg, ctl, info, &ch, note); err != nil || !ok {
-				ctl.post("/ctl/quit")
 				return err
 			}
 		}
@@ -240,7 +232,6 @@ flags:
 			return browserScreen(cfg, ctl, info.Paste)
 		}
 		if *yes || err != nil && !interactive {
-			ctl.post("/ctl/quit")
 			return err
 		}
 		note = ""
@@ -253,7 +244,7 @@ flags:
 	if _, err := ctl.post("/ctl/start?" + q.Encode()); err != nil {
 		return err
 	}
-	return attach(cfg, false)
+	return attach(cfg)
 }
 
 func validTransport(t string) bool {
@@ -265,34 +256,57 @@ func validTransport(t string) bool {
 	return false
 }
 
-// spawnServer starts the session server in the background, detached from
-// this terminal, and waits for its socket.
-func spawnServer(cfg *config) error {
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
+// startServer serves the session from this process, logging to its
+// server.log. stop ends the session, as do SIGHUP and SIGTERM (the
+// terminal closing, say), and waits for it to clean up: closing shares,
+// letting go of the browser.
+func startServer(cfg *config) (stop func(), err error) {
 	logf, err := os.OpenFile(cfg.path("server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer logf.Close()
-	cmd := exec.Command(self, "__serve", cfg.Dir)
-	cmd.Stdout, cmd.Stderr = logf, logf
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return err
+	log.SetOutput(logf)
+	sc := *cfg // the server's own, which it updates
+	s, err := listen(&sc)
+	if err != nil {
+		logf.Close()
+		return nil, err
 	}
-	cmd.Process.Release()
-	sock := cfg.path("sock")
-	for range 100 {
-		if c, err := net.Dial("unix", sock); err == nil {
-			c.Close()
-			return nil
+	done := make(chan struct{})
+	go func() {
+		if err := s.run(); err != nil {
+			log.Printf("session: %v", err)
 		}
-		time.Sleep(50 * time.Millisecond)
+		close(done)
+	}()
+	wait := func() {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+		}
 	}
-	return fmt.Errorf("session server didn't start; see %s", cfg.path("server.log"))
+	tstate, _ := term.GetState(int(os.Stdin.Fd()))
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-sigs:
+			log.Printf("%v: ending the session", sig)
+			s.quit()
+			wait()
+			if tstate != nil {
+				term.Restore(int(os.Stdin.Fd()), tstate)
+			}
+			os.Exit(1)
+		case <-done:
+		}
+	}()
+	return func() {
+		s.quit()
+		wait()
+		signal.Stop(sigs)
+		logf.Close()
+	}, nil
 }
 
 func termSize() (int, int) {
@@ -609,7 +623,7 @@ func listCmd() error {
 			case st.ExitCode != nil:
 				state = fmt.Sprintf("exited %d", *st.ExitCode)
 			default:
-				state = fmt.Sprintf("running, %d attached", st.Terminals)
+				state = "running"
 			}
 			state += " · " + strings.Join(si.shares, ",")
 		}
@@ -641,44 +655,23 @@ func shareCmd(args []string) error {
 	return nil
 }
 
-func attachCmd(args []string) error {
-	fs := flag.NewFlagSet("shoulder attach", flag.ExitOnError)
-	fs.Parse(args)
-	cfg, err := findSession(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	if cfg.Browser != "" {
-		return browserScreen(cfg, newCtl(cfg.path("sock")), "")
-	}
-	return attach(cfg, true)
-}
-
 // ---------------------------------------------------------------------------
-// Attaching a terminal.
+// The terminal.
 
 // terminalReset undoes modes a full-screen program may have left on, so
 // the terminal is usable after the session ends. Leaving the alternate
 // screen can restore a stale saved cursor, so it ends at the bottom row.
 const terminalReset = "\x1b[0m\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\x1b[999;1H"
 
-// attach connects this terminal to a session. A terminal that just
-// started the session skips the repaint, as with dtach.
-func attach(cfg *config, repaint bool) error {
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return errors.New("attaching needs a terminal")
-	}
+// attach connects this terminal to the session's command, until it exits.
+func attach(cfg *config) error {
 	conn, err := net.Dial("unix", cfg.path("sock"))
 	if err != nil {
-		return fmt.Errorf("session %s isn't running: %w", cfg.Name, err)
+		return err
 	}
 	defer conn.Close()
 	cols, rows := termSize()
-	rp := "1"
-	if !repaint {
-		rp = "0"
-	}
-	fmt.Fprintf(conn, "GET /ctl/attach?cols=%d&rows=%d&repaint=%s HTTP/1.1\r\nHost: shoulder\r\nConnection: Upgrade\r\nUpgrade: shoulder\r\n\r\n", cols, rows, rp)
+	fmt.Fprintf(conn, "GET /ctl/attach?cols=%d&rows=%d HTTP/1.1\r\nHost: shoulder\r\nConnection: Upgrade\r\nUpgrade: shoulder\r\n\r\n", cols, rows)
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
@@ -740,8 +733,7 @@ func attach(cfg *config, repaint bool) error {
 	restore()
 	os.Stdout.WriteString(terminalReset)
 	if exitCode >= 0 {
-		fmt.Printf("\r\n[%s exited with status %s; agents can still read the session for %s]\n",
-			filepath.Base(cfg.Command[0]), strconv.Itoa(exitCode), cfg.Linger)
+		fmt.Printf("\r\n[%s exited with status %s]\n", filepath.Base(cfg.Command[0]), strconv.Itoa(exitCode))
 		return nil
 	}
 	fmt.Printf("\r\n[lost the session %s]\n", cfg.Name)

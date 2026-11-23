@@ -15,10 +15,9 @@ type vterm struct {
 	emu           *vt.Emulator
 	cursorVisible bool
 	modes         map[ansi.DECMode]bool
-	leftAlt       bool // the program left the alternate screen since the last check
 }
 
-// replayModes are the input modes a reattaching terminal needs restored for
+// replayModes are the input modes a repaint restores, for
 // keys, the mouse, and pasting to keep working.
 var replayModes = []ansi.DECMode{
 	ansi.ModeCursorKeys,
@@ -33,11 +32,6 @@ func newTerm(cols, rows int, replies func([]byte)) *vterm {
 	t := &vterm{emu: vt.NewEmulator(cols, rows), cursorVisible: true, modes: map[ansi.DECMode]bool{}}
 	t.emu.SetCallbacks(vt.Callbacks{
 		CursorVisibility: func(v bool) { t.cursorVisible = v },
-		AltScreen: func(on bool) {
-			if !on {
-				t.leftAlt = true
-			}
-		},
 		EnableMode: func(m ansi.Mode) {
 			if d, ok := m.(ansi.DECMode); ok {
 				t.modes[d] = true
@@ -64,16 +58,7 @@ func newTerm(cols, rows int, replies func([]byte)) *vterm {
 	return t
 }
 
-func (t *vterm) write(b []byte)  { t.emu.Write(b) }
-func (t *vterm) altScreen() bool { return t.emu.IsAltScreen() }
-
-// tookLeftAlt reports, once, that the program has left the alternate
-// screen.
-func (t *vterm) tookLeftAlt() bool {
-	left := t.leftAlt
-	t.leftAlt = false
-	return left
-}
+func (t *vterm) write(b []byte)         { t.emu.Write(b) }
 func (t *vterm) size() (cols, rows int) { return t.emu.Width(), t.emu.Height() }
 func (t *vterm) resize(cols, rows int)  { t.emu.Resize(cols, rows) }
 
@@ -93,7 +78,7 @@ func (t *vterm) text() string {
 }
 
 // ansi renders the screen as escape sequences that repaint a terminal of
-// the same size: what a reattaching terminal sees.
+// the same size: what agents get with format=ansi.
 func (t *vterm) ansi() []byte {
 	var b strings.Builder
 	b.WriteString("\x1b[0m\x1b[H\x1b[2J")

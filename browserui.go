@@ -52,7 +52,7 @@ func availableKinds() []struct{ key, name, label string } {
 
 // readKeys waits up to d for keys and returns them (none on timeout).
 // It only reads when there's input, so nothing is left reading the
-// terminal when it's handed to attach. (poll(2) doesn't work on macOS
+// terminal when the command starts. (poll(2) doesn't work on macOS
 // terminals; select(2) does.)
 func readKeys(d time.Duration) ([]byte, error) {
 	fd := int(os.Stdin.Fd())
@@ -407,7 +407,7 @@ func pickTab(cfg *config, res browserStart) (mode, pick string, ok bool) {
 
 // browserScreen shows a sharing browser session: the shared tabs and
 // what agents do in them, until the person stops sharing or the browser
-// goes away. paste is "" when reattaching.
+// goes away.
 func browserScreen(cfg *config, c *ctl, paste string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return browserLog(c)
@@ -447,14 +447,7 @@ func browserScreen(cfg *config, c *ctl, paste string) error {
 				restore()
 				fmt.Printf("Stopped sharing %s.\n", a.Label)
 				return nil
-			case 'd':
-				restore()
-				fmt.Printf("Still sharing %s: `shoulder attach %s` comes back here.\n", a.Label, cfg.Name)
-				return nil
 			case 'c':
-				if paste == "" {
-					break
-				}
 				if err := copyToClipboard(paste); err != nil {
 					note = "couldn't copy: " + err.Error()
 				} else {
@@ -472,11 +465,7 @@ func drawBrowserScreen(cfg *config, paste string, a browserActivity, note string
 		lines = append(lines, strings.Split(fmt.Sprintf(format, args...), "\n")...)
 	}
 	p("%sshoulder%s · session %s%s%s · sharing %s\n", bold, reset, bold, cfg.Name, reset, a.Label)
-	if paste != "" {
-		p("Paste this to an agent (Claude Code, Codex, or one on another machine):\n\n%s%s%s\n", bold, paste, reset)
-	} else {
-		p("`shoulder share %s` prints the line to paste to an agent.\n", cfg.Name)
-	}
+	p("Paste this to an agent (Claude Code, Codex, or one on another machine):\n\n%s%s%s\n", bold, paste, reset)
 	if len(a.Tabs) == 0 {
 		p("%stabs%s   none: the shared tabs were closed (an agent can still open one)", bold, reset)
 	}
@@ -502,10 +491,7 @@ func drawBrowserScreen(cfg *config, paste string, a browserActivity, note string
 		p("%s", fit(fmt.Sprintf("%s %s %s — %s%s", head, t.ID, cmpOr(t.Title, "(untitled)"), t.URL, extra), cols+len(bold)+len(reset)))
 	}
 	p("")
-	foot := []string{"", fmt.Sprintf("%s[c]%s copy   %s[d]%s detach (keep sharing)   %s[q]%s stop sharing", bold, reset, bold, reset, bold, reset)}
-	if paste == "" {
-		foot[1] = fmt.Sprintf("%s[d]%s detach (keep sharing)   %s[q]%s stop sharing", bold, reset, bold, reset)
-	}
+	foot := []string{"", fmt.Sprintf("%s[c]%s copy   %s[q]%s stop sharing", bold, reset, bold, reset)}
 	if note != "" {
 		foot = append(foot, note)
 	}
@@ -543,7 +529,7 @@ func formatActivity(a activity) string {
 // browserLog is browserScreen without a terminal: activity as lines on
 // stdout, until the browser goes away or shoulder is interrupted.
 func browserLog(c *ctl) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	var seen time.Time
 	for first := true; ; first = false {

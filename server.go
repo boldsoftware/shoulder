@@ -27,10 +27,11 @@ import (
 )
 
 // server is a session: it owns the command's PTY, keeps a terminal
-// emulator in step with it (so the screen can be rendered for agents and
-// repainted for reattaching terminals), and serves both over HTTP. Its own
-// Unix socket carries the control API, terminal attachments, and the agent
-// API; shares add more listeners for the agent API only.
+// emulator in step with it (so the screen can be rendered for agents),
+// and serves both over HTTP. It runs inside the shoulder process and ends
+// with it. Its Unix socket carries the control API, your terminal's
+// connection, and the agent API; shares add more listeners for the agent
+// API only.
 type server struct {
 	cfg      *config
 	rwToken  string
@@ -73,15 +74,13 @@ type server struct {
 const maxOutput = 8 << 20
 
 type config struct {
-	Name     string        `json:"name"`
-	Dir      string        `json:"dir"`
-	Command  []string      `json:"command"`
-	Cwd      string        `json:"cwd"`
-	Started  time.Time     `json:"started"`
-	Linger   time.Duration `json:"linger"`
-	Port     int           `json:"port"`
-	Host     string        `json:"host"` // this machine's name, for agents' context
-	Attached bool          `json:"-"`
+	Name    string    `json:"name"`
+	Dir     string    `json:"dir"`
+	Command []string  `json:"command"`
+	Cwd     string    `json:"cwd"`
+	Started time.Time `json:"started"`
+	Port    int       `json:"port"`
+	Host    string    `json:"host"` // this machine's name, for agents' context
 
 	// A browser session shares a browser ("chrome", "safari") instead of
 	// running Command.
@@ -97,16 +96,8 @@ func (c *config) save() error {
 	return os.WriteFile(c.path("config.json"), b, 0o600)
 }
 
-// serve is the session server's main: `shoulder __serve <dir>`.
-func serve(dir string) error {
-	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
-	if err != nil {
-		return err
-	}
-	cfg := new(config)
-	if err := json.Unmarshal(b, cfg); err != nil {
-		return err
-	}
+// listen starts serving a session on its Unix socket; run does the rest.
+func listen(cfg *config) (*server, error) {
 	s := &server{
 		cfg:      cfg,
 		rwToken:  newCode(),
@@ -124,29 +115,31 @@ func serve(dir string) error {
 	os.Remove(s.ctlSock)
 	ln, err := net.Listen("unix", s.ctlSock)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer os.Remove(s.ctlSock)
 	os.Chmod(s.ctlSock, 0o600)
 	unixShare, _ := openShare(context.Background(), s, "unix")
 	s.shares["unix"] = unixShare
 	srv := &http.Server{Handler: s.handler(unixShare)}
 	go srv.Serve(ln)
+	return s, nil
+}
 
+// run serves the session until the command exits, the browser goes away,
+// or quit, and then closes its shares.
+func (s *server) run() error {
+	defer os.Remove(s.ctlSock)
 	defer s.closePending()
-	// A session nobody starts goes away on its own.
 	select {
 	case <-s.started:
 	case <-s.quitting:
-		return nil
-	case <-time.After(time.Hour):
 		return nil
 	}
 	if s.browser != nil {
 		return s.serveBrowser()
 	}
 	go s.watchForeground()
-	err = s.cmd.Wait()
+	err := s.cmd.Wait()
 	code := 0
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
@@ -159,10 +152,24 @@ func serve(dir string) error {
 		c.send(frameExit, binary.LittleEndian.AppendUint32(nil, uint32(code)))
 	}
 	s.mu.Unlock()
-	log.Printf("command exited with status %d; lingering %s", code, cfg.Linger)
-	select {
-	case <-time.After(cfg.Linger):
-	case <-s.quitting:
+	log.Printf("command exited with status %d", code)
+	// Give your terminal a moment to read the exit and hang up.
+	deadline := time.After(2 * time.Second)
+wait:
+	for {
+		s.mu.Lock()
+		n, ch := len(s.clients), s.changed
+		s.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		select {
+		case <-ch:
+		case <-deadline:
+			break wait
+		case <-s.quitting:
+			break wait
+		}
 	}
 	s.mu.Lock()
 	for _, sh := range s.shares {
@@ -173,7 +180,7 @@ func serve(dir string) error {
 }
 
 // quit ends the session: it hangs up on the command, as closing its
-// terminal would, and stops serving without lingering.
+// terminal would, and stops serving.
 func (s *server) quit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -242,13 +249,8 @@ func (s *server) readLoop() {
 				s.base += int64(drop)
 			}
 			s.lastOutput = time.Now()
-			left := s.vt.tookLeftAlt()
 			for c := range s.clients {
 				c.send(frameData, data)
-				if left && c.stale {
-					c.send(frameData, s.vt.ansi())
-					c.stale = false
-				}
 			}
 			s.notifyLocked()
 			s.mu.Unlock()
@@ -325,7 +327,7 @@ func (s *server) resizeLocked(cols, rows int) {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal attachments. A client upgrades GET /ctl/attach and then speaks
+// Your terminal. shoulder's own terminal upgrades GET /ctl/attach and speaks
 // frames: [type u8][len u32 LE][payload].
 
 const (
@@ -335,14 +337,10 @@ const (
 )
 
 type client struct {
-	// stale: attached during a full-screen program, so the terminal never
-	// saw the screen underneath, and needs it painted when the program
-	// leaves the alternate screen.
-	stale bool
-	conn  net.Conn
-	q     chan []byte
-	cols  int
-	rows  int
+	conn net.Conn
+	q    chan []byte
+	cols int
+	rows int
 }
 
 // send queues a frame without blocking; a client too slow to keep up is
@@ -402,15 +400,9 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	if s.vt != nil {
-		// The newest terminal owns the size; repaint it from the emulator,
-		// except for the terminal that just started the session, whose
-		// screen is already right (and may hold the paste line).
+		// The newest terminal owns the size.
 		s.owner = c
 		s.resizeLocked(cols, rows)
-		if r.URL.Query().Get("repaint") != "0" {
-			c.send(frameData, s.vt.ansi())
-			c.stale = s.vt.altScreen()
-		}
 	}
 	if s.exited {
 		c.send(frameExit, binary.LittleEndian.AppendUint32(nil, uint32(s.exitCode)))
@@ -425,6 +417,7 @@ func (s *server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		if s.owner == c {
 			s.owner = nil
 		}
+		s.notifyLocked()
 		s.mu.Unlock()
 	}()
 

@@ -32,12 +32,14 @@ func testSession(t *testing.T) (*config, *ctl) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	cfg := &config{Name: "test-session", Dir: dir, Command: []string{bash, "--norc", "--noprofile", "-i"},
-		Cwd: dir, Host: "testhost", Linger: time.Minute}
-	b, _ := json.Marshal(cfg)
-	os.WriteFile(cfg.path("config.json"), b, 0o600)
+		Cwd: dir, Host: "testhost"}
 	os.Setenv("PS1", "$ ")
+	s, err := listen(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
-	go func() { done <- serve(dir) }()
+	go func() { done <- s.run() }()
 	c := newCtl(cfg.path("sock"))
 	t.Cleanup(func() {
 		c.post("/ctl/quit")
@@ -199,7 +201,7 @@ func TestSessionAPI(t *testing.T) {
 		t.Errorf("localhost screen:\n%s", s)
 	}
 
-	// A terminal attaching gets the screen repainted.
+	// The terminal.
 	conn, err := net.Dial("unix", cfg.path("sock"))
 	if err != nil {
 		t.Fatal(err)
@@ -210,10 +212,6 @@ func TestSessionAPI(t *testing.T) {
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("attach: %v %v", resp, err)
-	}
-	typ, p, err := readFrame(br)
-	if err != nil || typ != frameData || !strings.Contains(string(p), "done-42") {
-		t.Fatalf("repaint: %d %q %v", typ, p, err)
 	}
 	// Typing in the terminal reaches the command, and its exit reaches the terminal.
 	writeFrame(conn, frameData, []byte("exit 3\r"))
